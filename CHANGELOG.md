@@ -4,6 +4,241 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.69 - 2026-11-20
+
+Hy4-Flash reads pictures without VRAM of their own (whole pictures on 8 GB cards too), reads long prompts faster, reaches
+longer contexts with KV streaming and drafts with a small DFly2 drafter on cards too small for the MTP block; the setup
+offers Hy4-Flash on AMD under Windows as experimental; and a fix for GLM on Windows with a Radeon card that did not start.
+
+- **Hy4-Flash: pictures take no VRAM of their own:** in v1.1.68 the engine kept up to 0.8 GB of VRAM free on the main GPU for a picture, and 8 GB cards read big pictures scaled down. A picture is now read in the engine's prompt buffers, which are idle while it is read, so no VRAM is kept for pictures: that room holds experts instead (on our one-V100 test PC, 53% of the routed experts in VRAM instead of 50%, as with pictures off), and 8 GB cards read pictures at full size (a 2048 x 2048 picture whole). On a PC where the experts do not all fit in VRAM, other experts now sit in VRAM, so answers can differ slightly from v1.1.68's with pictures on; they are the answers v1.1.68 gave with pictures off. `HY4_VISION_LEND=0` keeps the room free as before.
+- **Hy4-Flash: long prompts read faster:** past 8,192 tokens the indexer's scores run on the tensor cores, and with tensor parallel each card picks the positions for its share of the prompt and the cards swap their picks. Prompt reading (prefill) against v1.1.68 on our test PC with three Tesla V100s (Maya-XS, tensor parallel): about +8% at 16K tokens, +28% at 64K and +56% at 128K; with one V100 and the CPU computing the other experts: about +7% to +14% from 16K tokens. Prompts up to 8,192 tokens are read exactly as before. Past that the scores are rounded to 16 bits, so a long prompt's answer can differ slightly in wording (in our checks the top token matched as often as between two prompt chunk sizes). NVIDIA only; AMD reads prompts as before. `HY4_IX_GEMM=0 HY4_SPARSE=0` reads them as in v1.1.68.
+- **Hy4-Flash on AMD under Windows (experimental):** the setup no longer stops on a Windows PC with an AMD GPU (Strix Halo / Gorgon Halo, or a Radeon card): it builds Hy4-Flash's engine for AMD there as it does on Linux and says once that this is experimental - we have not run it on Windows ourselves. Tensor parallel is off there unless `--tp` asks for it, and on a Halo the engine counts only the memory Windows gives the GPU. If it misbehaves, please open an issue with the engine's log; [docs/AMD_MAYA.md](docs/AMD_MAYA.md#hy4-flash-under-windows-experimental) says how to fall back.
+- **Hy4-Flash: longer contexts with KV streaming:** where the cache of a long context does not fit in VRAM, the engine can keep only the newest positions of the indexed layers' cache in VRAM and every position in RAM, and read the few positions each token looks at from RAM. `--kv-streaming on|off|auto` (off by default; `auto` streams only where the context does not fit any other way and the RAM holds the rows). The setup and the Models page now offer the contexts that fit this way and show the RAM they take (for example an 8 GB card reaches 256K instead of 32K). The answers are the same as with the whole cache in VRAM; it costs a few percent of speed where it streams (about 3-5% on prompts and decode at 128K on our one-V100 test PC), and nothing where it does not.
+- **Hy4-Flash: DFly2 drafting:** besides Tencent's MTP block, Maya's sizes can draft with a small DFly2 drafter (one file a size, under 1 GB of VRAM where the MTP block takes about 4 GB), so cards too small for the block get drafting too. Where both fit, a short speed check at the first start keeps the faster of the two on that PC (`--speed-calibration` measures again); until then Maya-XS drafts with DFly2 and Maya-S, -M and -L with the MTP block. `--drafting on|off|mtp|dfly2|measure` picks by hand. As with the block, the model checks every drafted token, so Maya only writes tokens the model itself would pick. The drafter is loaded only where its room changes nothing else in the start (cache rows, picture size, prompt span, KV streaming); elsewhere the engine says so and decodes without drafts, so drafting on and off give the same answers. Decode against no drafting on our test PCs: an RTX 3050 8 GB card at a 4K context about +29% on code and +3% on chat (at 8K the drafter does not fit beside the F16 cache, and the setup says so and names the context that fits); a Radeon (Gorgon Halo) with Maya-XS about +40-85%; one Tesla V100 with the CPU computing the other experts about +38-41% on code and +6-13% on chat. DFly2 runs on one GPU (several GPUs keep the MTP block), and is off where the cache is streamed.
+- **Hy4-Flash on AMD: prompts read about 2-2.5x faster, drafting about 30% faster:** on AMD the prompt's large matrix products now run through hipBLASLt with the fastest kernel measured for each shape on the PC (as DeepSeek and MiniMax already do), and the attention, the window products and the conversions got faster kernels. On our Gorgon Halo (Radeon 8065S) with Maya-XS against v1.1.68: prompt reading about 2-2.5x faster from 2K to 16K tokens, decode about +10% without drafting and +27-31% with it. The new matrix products sum in another order, so wording can differ slightly from v1.1.68 (as much as a different prompt chunk does; same quality in our checks); `HY4_LT=0` uses hipBLAS as before.
+- **Fix: Hy4-Flash on AMD, drafting could change an answer's wording:** on AMD, the kernels that check drafted tokens rounded one term of the K-quant experts (Maya-L's) differently from the kernels that write a token alone, so an answer with drafting could differ from the same answer without it. They round alike now: drafting on gives exactly the answer of drafting off (checked with Maya-L and Maya-XS).
+- **Hy4-Flash: faster decoding where the CPU computes experts (small cards):** the CPU threads that compute the experts outside VRAM prepare each token's inputs once instead of once per expert, and take their cores from the whole process. Decode against v1.1.68 on our test PCs, the same answers: one Tesla V100 about +8-12%, the Gorgon Halo PC with every expert on the CPU about +6-18%, an RTX 3050 8 GB card about +3-4%. In addition, for the 2-bit (IQ2_XXS) experts, the CPU can keep 4-bit copies of the busiest ones, which give exactly the same results and are faster on some CPUs: Maya measures this once per PC at the first start (`--speed-calibration` measures again) and keeps the copies only where answers come faster (our RTX 3050 PC: kept, about +7-12% more; our V100 PC: not kept). `HY4_Q4X=1` / `0` keeps them on or off by hand.
+- **Hy4-Flash: faster decoding with drafts on tensor parallel, and on AMD (#1056):** where the main GPU is not one of the tensor-parallel GPUs, the output head and the drafts' head are split over the GPUs; a step can add a fourth draft while the drafts keep being right (`--draft-more`, `--draft-sure`, `--draft-streak`); the MTP block's passes skip the rows no draft needs; the Engram lookups run beside the GPUs; on newer GPUs (NVIDIA from Ampere on, AMD on Linux) a second GPU stream runs the indexer and the cache rows beside the rest (`HY4_IX_FORK` / `HY4_ATTN_FORK`; off on Tesla V100s, where it was slower); and the attention, indexer and low-bit matrix-vector kernels got faster. The same answers (greedy: every layout we checked, byte for byte). Decode on our test PCs with Maya-XS and the MTP block, against the same build without it: three Tesla V100s in tensor parallel about +9% on code, +10% on chat and +10% without drafts; two V100s about +10-12%; a main GPU outside the group (our three V100s with `--tp 2`) about +5-9%; the Gorgon Halo (Radeon 8065S) about +10% with drafts and +9% without; one V100 with the CPU lane about +1-3%; an RTX 3050 8 GB card unchanged.
+- **Fix: Hy4-Flash's engine could end with a crash when Maya stopped it** (seen on AMD under Linux): after its answers, the engine's input thread could touch memory already freed at the stop, and the engine ended with a glibc error and a core dump instead of a clean exit. It now exits cleanly; the answers were never affected.
+- **Monitor: Hy4-Flash's experts in VRAM under tensor parallel:** with two or more GPUs in tensor parallel, "Where the experts live" said no expert was in VRAM although every expert was on the cards (a user's report): the engine counted only one placeholder copy. It now counts every card's experts. Hover notes now explain Requests served, PCIe, System RAM and Disk read. The answers are unchanged.
+- **Fix: GLM on Windows with a discrete Radeon card did not start** (#1035, #924): the start ended with "warmed expert tables did not upload". Maya looked for how much memory Windows lets it lock while the card was already nearly full, and that search left the card unusable for the rest of the start. On Windows with one discrete Radeon card, Maya now measures that limit before the expert pool is placed and sizes the RAM tier under it. Linux, NVIDIA, the APUs and PCs with several GPUs are unchanged. `MAYA_GLM_PIN_MEASURE_FIRST=0` brings back the old order. We have no such PC; a user is testing it.
+- **Setup: a Hy4-Flash size too big for the card names itself:** for example "Hy4-Flash · Maya-S needs about 8.8 GB ...", and where a smaller size fits the card the setup names it and the command to set it up (Maya-XS for an 8 GB card). The engine's own message, when the model's parts do not fit at the smallest context, no longer suggests a smaller context.
+- **Hy4-Flash: experts in VRAM that follow the answers (`HY4_HOT=1`, opt-in):** on a PC whose GPU holds only some of a layer's experts, the experts kept in VRAM follow the ones the answers use, swapped in during long answers and between requests, and the start places last time's most-used ones first. Off by default; with it off nothing changes. On, other experts sit in VRAM, so wording can differ slightly (same quality in our checks). Decode on our one-V100 test PC: about +22% with 16 GB of VRAM for the model, +7% with 12 GB, nothing on an 8 GB card (no experts there to swap).
+- **Community fixes:**
+  - Windows + AMD, GLM: the expert prefetch's copies (`MAYA_GLM_PF_CE`) are submitted at once, so the prefetch no longer stalls decoding (#1015).
+  - AMD, EXL3: the matrix-vector kernel loads the next chunk's input before its weights - the same loads and the same results (#1013).
+  - DeepSeek on two AMD RDNA3 cards: the buffers the cards sum their parts through are read uncached, so each card sees the other's writes (#1053).
+  - The tokenizer says plainly when its token table is damaged, instead of a bare KeyError (#1014).
+  - DeepSeek: a GGUF expert-cache move that fails is discarded instead of being used (#935).
+  - Windows: the build log's text is no longer garbled, and MSVC's C4819 warnings are off (#894).
+  - Docs: `MAYA_GLM_DSA_FFN_GRAPH` documented, and the KDA graph rows match the code (#1041).
+  - AMD, GLM: switching conversations copies through one pinned buffer kept for the engine's life, so a switch no longer stops the answer (#1037).
+  - AMD, GLM: the FP16 weight scratch is sized for `MAYA_GLM_PREFILL_BLAS` when that setting is on (#1047).
+- **For developers:** when a GLM drafting step stalls, its log line now says what the stalled step waits for: a look-ahead read or a demoted expert's copy (#860). It only reports.
+- **Docs:** the README (all four languages), docs/MEMORY.md, docs/MODELS.md and docs/SETTINGS.md say pictures work on every card that runs Hy4-Flash; docs/AMD_MAYA.md and docs/WINDOWS.md have the new Windows + AMD section.
+- **Credits:** the faster Hy4-Flash decoding with MTP drafts on tensor parallel (#1056: the output and draft heads split over the GPUs, a fourth draft when the drafts are sure, leaner MTP passes, Engram lookups beside the GPUs, a second GPU stream on newer GPUs, faster attention, indexer and GEMV kernels) was contributed by @needmorevram. Faster long-prompt reading in Hy4-Flash (the indexer's scores on the tensor cores and the indexer's picks split over the cards) and the experts that follow the answers (`HY4_HOT`) build on ideas from @alesha-pro's Hy4-Flash engine work (the latter on an adaptive expert cache). Thank you both. The community fixes above are by @Mqrius, @pepuscz, @paltian, @TheArchitectit, @NektoDron, @Cayahuanca, @Andrey0710, @EncryptionLTD and @zehm. The rest of this release (the picture, prompt, drafting, KV streaming, AMD and Windows work, the GLM fix and the dashboard) is by @mw00 (peasantsmith).
+
+## v1.1.68 - 2026-11-19
+
+A new model: Hy4-Flash, Tencent's 220 B model, on an engine of its own, with Maya's own quants in four sizes for PCs from about 56 to 128 GB of RAM + VRAM and cards from 8 GB.
+
+- **New model: Hy4-Flash:** Tencent's [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) (220 B parameters; the Tencent Hy License) runs on a new engine, `maya-hy4`. Set it up with `./maya.sh --setup --model hy4-flash-maya-xs` (Windows: `START-MAYA.bat`), or pick "Hy4-Flash" in the setup's model list.
+- **Maya's own quants of it:** four sizes are [available now](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF): **Maya-XS** (a model file of 44.8 GB, the routed experts in 2 bits; for PCs with about 56-64 GB of RAM + VRAM), **Maya-S** (53.0 GB, 2 bits on layers 1-23 and 3 bits on layers 24-41; 68-80 GB), **Maya-M** (68.4 GB, 3 bits; 80-96 GB) and **Maya-L** (89.5 GB, 4 bits; 104-128 GB). The setup lists them and recommends one by the PC's memory (`--model hy4-flash-maya-s`, `hy4-flash-maya-m`, `hy4-flash-maya-l` name one). Every size shares one n-gram table (63.4 GB, Tencent's own values): it is downloaded once, stays on the SSD and is read from there while the model answers, so it does not need to fit in memory. About 110 GB of disk in all for Maya-XS (116 GB for Maya-S, 132 GB for Maya-M, 153 GB for Maya-L); keep it on an SSD / NVMe, not a hard disk.
+- **Setup and model picker:** the setup checks the PC and picks the layout and the context that fit the card by itself (4K to the model's 1M, each offered where it fits the VRAM). For a card of 8 GB it picks a layout of Maya-XS made for small cards (slightly lower quality), with contexts up to 32K. A card with less than about 7 GB of free VRAM cannot run the model, and the setup says so. It downloads the files from Maya's repo, builds the engine's index of them and writes the config. `--model-dir <folder>` uses files you already have.
+- **Drafting on Maya's sizes:** Maya-XS, Maya-S, Maya-M and Maya-L draft with Tencent's MTP block, the block Tencent's own GGUF files carry: it guesses the next tokens and the model checks every one, so Maya only writes tokens the model itself would pick. The block is one extra file for every size (7.5 GB, in Maya's repo, downloaded once by the setup). It takes about 4 GB of VRAM, so the setup turns drafting on where that fits beside the model (cards from about 16 GB) and leaves it off on smaller cards; `--drafting off`, or Drafting on the Models page, turns it off. On our test PC (one Tesla V100, the other experts computed on the CPU), decode with drafting on against off was about 20-40% faster on code, thinking answers and tool calls and about 7-20% faster on plain chat, with Maya-XS and Maya-L; a long prompt is read up to about 20% slower with it, because the block reads the prompt too.
+- **Prompt reading sized to the cards:** the engine reads a prompt in chunks and picks the chunk at every start: the largest of 4096, 2048 and 1024 tokens that the VRAM holds beside the model, its cache and the pictures' room (pictures and the context always go first; a larger chunk never costs tensor parallel). Larger chunks read long prompts faster. Its start line says which; `--chunk N` (Prompt chunk on the Models page) sets one by hand, and a card of 8 GB keeps its own small chunk. See [docs/SETTINGS.md](docs/SETTINGS.md).
+- **Long prompts on NVIDIA:** on prompts beyond 8,192 tokens, twelve of the model's layers keep their attention on the tensor cores up to 16,384 or 24,576 tokens where that is the faster way. The engine picks the span at every start by what the VRAM holds beside everything else (0.1-0.3 GB a card; it never costs a start, the layout, the context, the pictures or an expert its place in VRAM). It applies where NVIDIA GPUs hold the whole model; a single card that shares the experts with the CPU, and AMD, keep 8,192 unless `HY4_DENSE_MAX` names a span. The model looks at the same positions either way.
+- **Tencent's own Q4_K_M, with drafting:** the same setup also offers Tencent's own Q4_K_M (AngelSlim's GGUF) after Maya's sizes, or directly with `--model hy4-flash-q4_k_m`: it carries the model's MTP block, so it drafts (`--drafting off` turns that off). It needs about 170 GB of RAM + VRAM and was run on Linux with NVIDIA RTX 30 / A100 and newer cards.
+- **The model's own defaults:** Tencent's sampling (temperature 0.9, top-p 1.0), the release's own chat template, and its two thinking levels: High (the default) and Off; any other level asked for runs at High. Tool calls work, and the loop guard is on as for every model.
+- **Pictures, and a 256K context for the Q4_K_M:** Hy4-Flash reads pictures with its own vision tower, run in the engine a picture at a time. The setup downloads the vision file with the model (Maya's sizes: Maya's own, 0.8 GB; `--no-vision` skips it), and Images on the Models page turns pictures on or off. The tower's weights stay in the file; a picture takes up to 0.8 GB of VRAM while it is read, kept free on the main GPU - a card with less room beside the model (8 GB cards) reads smaller pictures: big ones are scaled down to what fits. Tencent's own Q4_K_M is offered up to a 256K context (its cache in 8-bit rows where tensor parallel needs them to hold it).
+- **Dashboard:** Hy4-Flash has its entry on the Models page (load, unload, delete; context, GPUs, tensor parallel, prompt chunk, CPU threads, VRAM kept free), the chat offers its thinking levels High and Off, and the Monitor shows the experts on the GPU against those computed on the CPU and the n-gram table's read time.
+- **Engine work for our files and small cards:** the engine reads the token embeddings and matrices in the types Maya's files use, keeps the n-gram table on the disk instead of mapping it into memory in the background (`HY4_EG_POPULATE=1` restores that), and the pack ignores the model's other files. The CPU threads that compute the experts outside VRAM stay busy through an answer instead of sleeping between layers: decoding is faster, and the CPU runs hotter while the model answers (`HY4_LANE_WAITS=0` turns that off; docs/SETTINGS.md).
+- **Hy4-Flash on AMD (Linux), Strix Halo and Gorgon Halo first:** the engine builds for AMD GPUs too (`./maya.sh --setup --backend hip --model hy4-flash-maya-xs`). On a Strix Halo / Gorgon Halo the whole model sits in the GPU's memory where the PC's memory holds it (64 GB: Maya-XS, 96 GB: Maya-M, 128 GB: Maya-L), with pictures, tool calls and both thinking levels; the setup says what fits. Run on a Gorgon Halo with the Radeon alone. With an AMD GPU on Windows it has not been tested yet.
+- **Known limits:** NVIDIA on Linux and Windows, AMD on Linux (not AMD on Windows yet, not Mac); pictures need about 0.8 GB of VRAM beside the model for the largest ones, so 8 GB cards read them scaled down; one request at a time (no `--parallel`): concurrency is coming soon.
+- **Docs:** Hy4-Flash in the README (all four languages), docs/MODELS.md, docs/SETUP.md, docs/MEMORY.md and docs/SETTINGS.md.
+- **Credits:** the base NVIDIA engine for Hy4-Flash (`maya-hy4`) and vision support were contributed by @needmorevram (#1040, #1051). The AMD device code is from @Cass67. The Maya quants, the setup and model picker, drafting for Maya's sizes, small-card and Windows support, AMD and Halo support, the prompt-reading work and the dashboard integration are by @mw00 (peasantsmith).
+
+## v1.1.67 - 2026-11-18
+
+A correctness fix for GLM on PCs where the experts do not all fit in VRAM, GLM now starts on a small graphics card instead of refusing, a fix for fresh installs on Windows, a little more GLM speed on the AMD + NVIDIA pair, and more exact wording about drafting.
+
+- **Fix: GLM could compute an expert with another expert's weights:** on a PC where some of GLM's experts sit in RAM, Maya moves experts between RAM and VRAM while it writes. An expert could be moved into VRAM twice at the same moment; once both copies had left again, Maya could still look for it in a place in RAM that by then held a different expert, and used that one's weights under its name. There was no error, only answers that were slightly off, and how often it happened grew with the share of the experts kept in RAM. An expert is now in VRAM only once, and a place in RAM is never reused while anything still points at it. Who is affected: GLM (GLM-5.3-Flash and GLM-5.3) on PCs where part of the experts sit in RAM; a PC whose VRAM holds every expert is not. On an affected PC answers can differ from v1.1.66, because they are now correct. Speed is unchanged.
+- **GLM decode on the AMD APU + NVIDIA GPU pair, about 4% more:** about +4% decode on top of v1.1.66 with a Tesla V100 beside the APU, measured as an A/B on the same PC (GLM-5.3-Flash Maya-S), with the same answers. Between the NVIDIA card's calls the integrated GPU had nothing to do and its clock dropped; Maya now keeps the integrated GPU busy with a tiny task while an answer is written, so its clock stays up. This costs power while an answer is written: measured about 2 W more on the APU and about 2 W more on the NVIDIA card (it waits less), about 4 W for the pair. It stops when the answer ends, and the energy per token is about 2% lower, because the answer is finished sooner. Maya times both ways during the first answers and keeps the integrated GPU busy only where that is faster on your PC. `MAYA_GLM_HELPER_WARM=0` turns it off.
+- **What drafting guarantees, said exactly:** with drafting (the MTP block or a DFlash2 drafter) the model checks every drafted token, so Maya only writes tokens the model itself would pick. The docs and the setup text said "the same answers" as without drafting, which was too strong: a drafter takes VRAM, so on a PC where the experts do not all fit, other experts sit in VRAM, and answers can differ from a run without the drafter. The docs and the setup text now say this.
+- **Fix: the setup on Windows could stop while unpacking llama.cpp:** from a folder such as `C:\Users\<name>\project-maya` with a name of six letters or more, one file's path passed Windows' limit of 260 characters during the unpack, and the setup ended with "No such file or directory". The unpack no longer depends on that limit, so a fresh install works whether or not Windows' long paths are switched on.
+- **Setup: the model menu:** GLM-5.3 (744B) has a row of its own, after GLM-5.3-Flash, and each of the two rows then lists that model's files only. The MiniMax and Qwen rows no longer say "new", and the Qwen row is the model's name alone (Qwen-3.8-Flash-Next); its files are named on the next screen as before.
+- **GLM starts on a small graphics card instead of refusing:** on a card with too little VRAM left for GLM's experts (for example GLM-5.3-Flash on an 8 GB card that also drives the desktop), Maya stopped at start with "no room for the expert pool". It now starts anyway: the experts stay in RAM and are computed on the CPU, or sent to the card just for the token that needs them. The answers are the model's as before; writing and reading prompts are much slower than on a card that holds the experts, drafting is off there, and the start's log says so. One GPU only; PCs that started before start and run exactly as before.
+- **Setup: said before the download when GLM-5.3-Flash will be slow on your card:** on a PC with one NVIDIA card, the setup now works out whether the card can hold the quant you pick: the weights the card always holds, the context, the engine's working memory and the smallest expert pool, against the card's VRAM less what the desktop and other programs use on it now. Where the experts do not fit (an 8 GB card that also drives the desktop), the model menu marks the row "runs slowly on this PC's 8 GB card (experts on the CPU)", the setup says so before the download and names the quants that do fit, and it goes on. Where the card is too small even for the weights it always holds, the row says "does not fit" and the setup stops before any download (`--force-fit` sets it up anyway). Two GPUs or more, AMD and Mac are not judged, as before.
+- **For developers:** `MAYA_GLM_TIER_VERIFY=1` (off by default, a diagnostic) checks GLM's expert tables after every token and reports an entry that points at the wrong place. It only reports.
+
+## v1.1.66 - 2026-11-17
+
+GLM decodes about 19% faster on an AMD APU + NVIDIA GPU pair with the same answers, two DeepSeek sizes can be installed side by side, DeepSeek's drafter experts are placed by how much they are used, and the idle sleeps are settings.
+
+- **Faster GLM decode on the AMD APU + NVIDIA GPU pair:** about +19% decode with a Tesla V100 beside the APU, measured as an A/B on the same PC (GLM-5.3-Flash Maya-S). The NVIDIA card reads each weight once per layer instead of twice while it checks drafted tokens, and the pair exchanges a whole layer of that check in one call instead of one call per token. Maya times both ways on your PC during the first answers and keeps the faster one, and it only makes that choice where both ways give the same answers (every expert in VRAM or on the helper GPU); everywhere else it keeps the order used so far. Every answer is bit for bit the same as before.
+- **Fix: two DeepSeek sizes side by side:** setting up a second DeepSeek size (for example Maya-S beside Maya-XS) replaced the first one's config, so the Models page showed only one of them and listed the other's files under "Files no model uses". Each size now gets its own config and both stay on the Models page. If you already hit this: after updating, click Download once on the missing size - Maya finds its files complete, downloads nothing again and only writes its config.
+- **DeepSeek: the drafter's experts count in the expert profile (#501, @noonghunna):** experts used by DeepSeek's drafter were never counted, so they were placed wherever room was left, and VRAM could stay unused on a second GPU. They are now counted like all the others. The profile fills in as you use the model: once a start uses the new profile, which experts sit in VRAM can change, and with that DeepSeek's answers can differ slightly from v1.1.65.
+- **Idle CPU use: the idle sleeps are settings (#951, @vbooka1):** how long an idle engine sleeps between looks for work can now be set at run time: `MAYA_GLM_SERVICE_NAP_US` and `MAYA_GLM_SERVICE_SLEEP_MS` for GLM, `MAYA_DS4_SERVICE_NAP_US` and `MAYA_DS4_SERVICE_SLEEP_MS` for DeepSeek. Longer sleeps lower the CPU use of a waiting server; the first token after a pause can wait up to one sleep. The defaults are the lengths used so far, so nothing changes unless you set one (docs/SETTINGS.md).
+- **Finding a GLM prompt fault on many GPUs (#1004, @GravelRashNZ):** when a GPU fault stops GLM while it reads a prompt, the error now names the GPU and the layer. `MAYA_GLM_PREFILL_CHECK=1` (off by default, a diagnostic that slows prompts down) also names the step that failed. It only reports.
+- **Community fixes:**
+  - Web chat: Enter that confirms a Japanese or Chinese input conversion in Safari no longer sends the message (#927, @takahiro-blab).
+  - Setup: the vision files of a DeepSeek GGUF placed directly in the models folder stay inside that folder (#973, fixes #972, @mercant1982).
+  - Setup: AMD cards count in the model recommendation, and a card reporting 19.98 GB is treated as a 20 GB card (#923, @Mqrius).
+  - DeepSeek: stopping an answer during a shared start no longer disturbs the next request (#906, @markrussi).
+  - Server: `MAYA_PAR_MAX` caps a config's `--parallel` before the engine starts, opt-in (#880, @pietroMastro92).
+  - DeepSeek EXL3: `tools/ds4/reorder.py` reorders third-party shards into the order Maya reads fastest (#929, @gopinath87607).
+  - Docs: uneven GGUF splitting over PCIe can make prompt reading much slower (#940, @mercant1982).
+  - Tests: one test no longer leaves a global setting changed (#982, @mercant1982).
+- **README:** new speed rows from community reports (#938 @oscarlius, #978 @wairentiun, #997 @atollerus-tm, #999 @kai-r, #1005 @Andrey0710) and bench results for `--parallel` on three V100s (#989, @noahark), in all four languages.
+
+## v1.1.65 - 2026-11-16
+
+A stability release: fixes for start-up and loading failures on AMD and Windows, a steadier AMD + NVIDIA pairing, clearer errors when the engine fails, and a test suite where a red test always means something.
+
+- **Fix: GLM on two 16 GB AMD cards found no room for the experts (#899, @bob-u):** on Linux with AMD GPUs, the free VRAM read right after Maya's budget check could still count the checked memory as used, so the expert pool got 0 slots and the engine stopped at start. Maya now waits until the freed memory reads as free again (`MAYA_GLM_POOL_CHECK_WAIT_MS`, Linux HIP only). The automatic layer split works again; the manual split is no longer needed.
+- **Fix: DeepSeek on Windows with several NVIDIA GPUs failed with "0 MiB free" (#794, @wolfwoof88, @benjaminfphillips and @KuroNekoMaid):** pinning the RAM copy of the experts could leave every GPU without usable VRAM on Windows. Maya now reads each GPU's free VRAM before and after the pin, and undoes the pin by itself when it leaves a GPU nearly empty, so `DS4_COPY_PIN=0` is no longer needed. When the free VRAM cannot be read, the load line now says why instead of "0 MiB free".
+- **Steadier AMD + NVIDIA pairing:** the APU side now imports the shared expert memory in a way the AMD driver does not track, so Linux moving memory around no longer pauses it for seconds at a time. GLM-5.3 (744B) still starts on the APU alone unless you use `--mixed-gpus on`.
+- **The same answers on every install of the AMD + NVIDIA pairing:** how the pair splits prompt work between the CPU and the GPUs no longer depends on a few percent of difference in each build's measured CPU timing, so two installs of the same model on the same GPUs give the same answers (`MAYA_GLM_LANE_STEPS=0` restores the old behaviour). EXL3 answers on the pair can differ slightly from v1.1.64.
+- **Clearer errors when the engine fails (#827, @anbow1):** an answer the engine stops because of a GPU fault is now reported as an error, not as "length". Streamed answers keep the text already sent and end with the API's own error event; other requests get HTTP 422 with type `engine_error` (not retried automatically by the OpenAI and Anthropic SDKs), the reason, the position and the partial text. The console line now names the failed step, the position and the context size.
+- **Finding a GLM drafting stall (#860, @githug2024):** if one drafting step takes longer than 20 s, the log now prints a `glm stall:` line saying where each GPU is stuck (`MAYA_GLM_STALL_S`). It only reports.
+- **Smaller fixes:**
+  - The "use a smaller `--vram-reserve-mib`" hint now only appears when it can help, and says that setting the reserve by hand turns off its automatic shrinking.
+  - The help says which flags a start of an existing config ignores.
+  - A speed calibration you ask for by name now runs when a GPU only holds a display's memory, with a warning; it still refuses while another Maya model is loaded.
+  - AMD install docs: what to do when Ubuntu's rocWMMA package lacks headers.
+  - `strata-device` accepts GPUs from compute capability 6.0, like the rest of Maya.
+- **Tests:** every known failing or flaky test now has its cause fixed: tests that need model files skip with the reason instead of failing, slow GPU tests are 5-8 times faster, tests that clashed in parallel runs no longer do, and the Windows and `nohup` runs pass.
+
+## v1.1.64 - 2026-11-15
+
+EXL3 models now pair an AMD Strix Halo or Gorgon Halo APU with an NVIDIA GPU too, GLM-5.3-Flash EXL3 prefills up to 2.5 times faster on the pair, and DeepSeek on several GPUs decodes as fast as before v1.1.58 again.
+
+- **New: EXL3 on an AMD Halo APU + NVIDIA GPU (Linux, experimental):** GLM-5.3-Flash's EXL3 quants now run on both GPUs at once, like the GGUF quants since v1.1.62. Maya tunes itself: the first start measures the APU alone and the pair, and keeps the pair only where it is faster. `--mixed-gpus off` turns it off.
+
+  A/B on the same PC (tokens per second; A = the APU alone, B = the APU and the NVIDIA GPU together; GLM-5.3-Flash EXL3 3.05 bpw):
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Decode, question 1 | 21.3 | 24.7 | +16% |
+  | Decode, question 2 | 20.7 | 21.7 | +5% |
+  | Prefill, 512 tokens | 40 | 91 | +128% |
+  | Prefill, 1K tokens | 62 | 116 | +87% |
+  | Prefill, 2K tokens | 92 | 146 | +59% |
+  | Prefill, 8K tokens | 134 | 333 | +149% |
+
+  A short chat message now gets its first token in about 1 s instead of about 3 s on the pair.
+
+- **Steadier AMD + NVIDIA pairing:** the APU side now shares the model's memory with the NVIDIA card in 1 GB pieces. The AMD driver's pauses of the APU side (seconds to minutes when Linux moved memory) became much rarer. GLM-5.3 (744B) still stays on the APU alone unless you start it with `--mixed-gpus on`.
+- **Where the model lives on the pair:** the experts the NVIDIA card does not hold stay in ordinary system RAM, shared by both GPUs, not in the APU's BIOS VRAM carve-out. There is one copy of the model, only activations cross between the GPUs, and no large BIOS VRAM reserve is needed (now in docs/SETTINGS.md).
+- **Fix: DeepSeek decode on several GPUs (#956, @speja969 and @mgabor3141):** since v1.1.58, DeepSeek on a layer split or `--tp` could keep its PCIe expert lane on when it gained nothing, which cost about 4-5% decode on the reporters' PCs. On several GPUs the lane now turns off again unless it measures faster, as in v1.1.57; one GPU is unchanged. `DS4_STREAM_TIE=keep|off` forces either rule. The first start after the update measures again.
+- **Qwen GGUFs with mixed expert formats:** Maya now runs Qwen GGUF quants whose expert gate and up weights use different formats in a layer (for example unsloth's UD-IQ1_S of Qwen3.8-Flash-Next). Every other quant packs and answers exactly as before.
+- **MiniMax: damaged model files are caught (#672, @tanutanu56):** the setup now checks MiniMax GGUF files already in your model folder by their checksum, once, and says which file to download again if one does not match. Before, it checked their size only. If the router still meets broken numbers, the error now says where they come from instead of naming an impossible expert.
+
+## v1.1.63 - 2026-11-14
+
+Fixes for v1.1.62: the DeepSeek engine builds on Windows again, and GLM on an AMD APU paired with an NVIDIA GPU no longer restarts its engine before every request.
+
+- **Fix: DeepSeek on Windows with an NVIDIA GPU (#983, @pietroMastro92):** v1.1.62's DeepSeek engine did not compile on Windows, so the setup could not update it. The new two-GPU code used Linux-only calls; it compiles on Windows again, and nothing else changes there.
+- **Fix: GLM on an AMD APU + NVIDIA GPU (Linux):** after a context change, an engine restart or an idle unload, Maya started the engine again before every request, about a minute each. It now starts once and stays running.
+
+## v1.1.62 - 2026-11-13
+
+AMD Strix Halo and Gorgon Halo APUs (Ryzen AI Max) can now be paired with an NVIDIA GPU: Maya runs one model on both at once, with GLM-5.3-Flash prefilling up to 3 times faster and DeepSeek-V4.1-Flash decoding up to 18% faster than on the APU alone.
+
+- **New: an AMD Halo APU and an NVIDIA GPU sharing one model (Linux, experimental):** the AMD side runs on ROCm (HIP) and the NVIDIA side on CUDA, both drivers loaded side by side in one PC. The NVIDIA card can sit in a USB4/PCIe dock. The two GPUs share one copy of the model in the APU's system memory: each computes its own part of every layer, and while it runs only activations cross between them, not the model's weights. For GLM-5.3-Flash the NVIDIA card runs attention, the KV cache, drafting and the most-used experts, and the APU computes every other expert in place from its own memory. For DeepSeek-V4.1-Flash the APU runs the whole model and the NVIDIA card computes its most-used experts for it.
+  - **Maya tunes itself:** when it finds both GPUs, the setup builds both engines and the first start measures each model on the APU alone and on both. It keeps both only where that is more than 3% faster; the Models page then shows "AMD + NVIDIA". `--mixed-gpus off` (or `"mixed_gpus": "off"`) turns it off.
+  - **Answers** repeat run to run, and can differ slightly from the APU alone.
+  - **GLM-5.3 (744B)** stays on the APU alone unless you start it with `--mixed-gpus on`: on some starts it stalls for a while on this setup.
+  - **Tested on** a Gorgon Halo APU (Radeon 8065S) with a Tesla V100 32 GB in a USB4 dock, ROCm 7.14 and CUDA 12.4. Strix Halo uses the same AMD code.
+
+  **Biggest gains, A/B on the same PC** (tokens per second; A = the APU alone, B = the APU and the NVIDIA GPU together)
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | GLM-5.3-Flash prefill, 32K tokens | 293 | 901 | +208% |
+  | GLM-5.3-Flash prefill, 8K tokens | 315 | 837 | +166% |
+  | GLM-5.3-Flash prefill, 2K tokens | 310 | 591 | +91% |
+  | GLM-5.3-Flash decode | 26.6 | 32.1 | +21% |
+  | DeepSeek-V4.1-Flash decode | 36.8 | 43.5 | +18% |
+  | DeepSeek-V4.1-Flash prefill, 32K tokens, `--mixed-gpus split` | 615 | 1,062 | +73% |
+
+  **All measurements**
+
+  GLM-5.3-Flash (Maya-S)
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Decode, question 1 | 30.2 | 34.4 | +14% |
+  | Decode, question 2 | 26.6 | 32.1 | +21% |
+  | Prefill, 2K tokens | 310 | 591 | +91% |
+  | Prefill, 8K tokens | 315 | 837 | +166% |
+  | Prefill, 32K tokens | 293 | 901 | +208% |
+
+  DeepSeek-V4.1-Flash (Maya-XS)
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Decode, question 1 | 36.8 | 43.5 | +18% |
+  | Decode, question 2 | 29.6 | 31.4 | +6% |
+  | Decode, question 3 | 44.7 | 49.6 | +11% |
+  | Prefill, 2K tokens | 283 | 322 | +14% |
+  | Prefill, 8K tokens | 475 | 528 | +11% |
+  | Prefill, 32K tokens | 615 | 696 | +13% |
+
+  DeepSeek-V4.1-Flash (Maya-XS) with `--mixed-gpus split`, for long documents: the NVIDIA card runs the first layers instead (decode is 1-4% slower than the APU alone)
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Prefill, 2K tokens | 283 | 348 | +23% |
+  | Prefill, 8K tokens | 475 | 674 | +42% |
+  | Prefill, 32K tokens | 615 | 1,062 | +73% |
+
+  With DeepSeek, requests with pictures, log-probabilities or refusal ablation run on the APU alone.
+
+- **Faster: GLM decode after a prefill on AMD APUs under Linux:** GLM-5.3-Flash (Maya-S) on the APU alone, v1.1.61 against v1.1.62. The answers now repeat run to run. Prefill and decode in a fresh chat are unchanged.
+
+  | Decode right after | v1.1.61 | v1.1.62 | Change |
+  |---|---|---|---|
+  | a 2K-token prefill | 20.9 | 29.2 | +40% |
+  | an 8K-token prefill | 19.7 | 20.7 | +5% |
+  | a 32K-token prefill | 16.6 | 21.0 | +27% |
+
+## v1.1.61 - 2026-11-12
+
+DeepSeek reads prompts up to 17% faster on AMD Ryzen AI Max APUs with the same answers, a fast prompt reading switch, faster EXL3 decode on AMD, and prompt lookup for MiniMax on one GPU.
+
+- **Faster: DeepSeek prompt reading on AMD Ryzen AI Max APUs:** Maya-XS reads prompts 14-17% faster than in v1.1.60 at every length from 2K to 128K tokens, and Maya-S 8-9% faster at 8K-32K, with identical answers. Each expert's weights are now unpacked once for more prompt rows, and the sparse attention handles all head groups of a token together without memory bank clashes. Measured on a Ryzen AI Max APU; other RDNA3 GPUs (Radeon RX 7000) use the same code.
+- **Faster: DeepSeek EXL3 decode on AMD:** EXL3 quants decode 5-8% faster than in v1.1.60 on a Ryzen AI Max APU, with identical answers (thanks @pepuscz for #945).
+- **DeepSeek: fast prompt reading (opt-in):** Models page > Speed > Fast prompt reading (or `"fast_prefill": true`, `--fast-prefill on`). For shorter prompts, the later layers also skip the rows that cannot affect the answer: on a Ryzen AI Max APU Maya-XS reads prompts about 14% faster at 2K and 12% faster at 8K than with it off. The answers can shift slightly, so it is off until you switch it on.
+- **MiniMax: prompt lookup on one GPU:** where an answer repeats earlier text (code edits, tool-call arguments, quoted text), the tokens that followed it earlier are checked in one step. On one GPU it is on: code and tool calls decoded about 6% faster than in v1.1.60 on our test PC, with the DSpark draft on. On several GPUs it is your choice (`--suffix-draft 3`).
+- **Setup: the speed calibration now measures code and tool calls too:** DeepSeek's and MiniMax's draft (DSpark) is kept or turned off by its speed on chat, code and tool calls together, not chat alone, so it stays on where it speeds up coding work. It applies the next time you run the setup.
+
+## v1.1.60 - 2026-11-11
+
+GLM-5.3-Flash decodes faster again on AMD Ryzen AI Max APUs (up to ~0.8% vs v1.1.59, back to v1.1.56's speed), turboderp's 2.25 bpw EXL3 quant of DeepSeek in the setup, DFlash2 drafting for GLM-5.3 (744B) as an opt-in, and fixes.
+
+- **Faster: GLM-5.3-Flash on AMD Ryzen AI Max APUs:** drafting decode is up to ~0.8% faster than in v1.1.59, back to v1.1.56's speed, with identical answers (how much depends on the system's state; sometimes there is no difference). Since v1.1.57 a routing buffer sized for GLM-5.3 (744B) slowed it; AMD builds now size it for the model. NVIDIA is unchanged.
+- **turboderp's DeepSeek-V4.1-Flash EXL3 at 2.25 bpw in the setup:** [turboderp's 2.25 bpw EXL3 quant](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3/tree/2.25bpw) of DeepSeek-V4.1-Flash-1017 is now in the setup's DeepSeek list (`--ds4-quant exl3-2.25`), the smallest of its EXL3 options: 158.6 GB of weights, about 160 GB of VRAM and RAM added together (192 GB recommended); 362 GB on disk with its Engram tables (an install of another EXL3 quant shares them). Every file is pinned and checked by size and sha256. Pictures work: the setup uses DeepSeek's own vision tower, shared with a GGUF install. DeepSeek's sampling and effort, DSpark drafting (chosen by the speed calibration) and the refusal ablation switch work as with the other EXL3 quants. It is listed, never recommended over Maya's own quants. Thanks to turboderp for the quant.
+- **GLM-5.3 (744B): DFlash2 drafting as an opt-in:** `--dflash GGUF` in a GLM-5.3 config's `"args"` is no longer refused: it drafts with Anbeeld's [GLM-5.3-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-DFlash2-GGUF) (CC BY-NC-ND 4.0: non-commercial use only) in place of the model's MTP block, and the engine checks that the drafter was made for GLM-5.3. The setup does not offer it: GLM-5.3 keeps drafting with its MTP block by default, which was faster at the default sampling everywhere we measured.
+- **README:** speed rows from community reports (#890 thanks @imaginitivename, #895 thanks @digitalhomesteader, #905 and #908 thanks @pepuscz, #934 thanks @bob-u, #939 thanks @scranst, #942 thanks @rim-jaynor), in all four languages.
+- **Fixes:**
+  - GLM-5.3 (744B) on AMD Ryzen AI Max APUs: the setup's context recommendation now keeps 4 GB more free for the engine's own buffers, so with GLM-5.3-Maya-XS on a 192 GB APU it recommends 32K instead of 64K, where a few experts were still read from the SSD. A longer context given with `--context` or kept from an earlier setup stays, with the warning.
+
+## v1.1.59 - 2026-11-11
+
+Refusal ablation for DeepSeek, MiniMax and GLM-5.3-Flash, Turbo for GLM-5.3 (744B), a setup that recommends the quant and context your PC's memory holds, and fixes.
+
+- **The setup recommends the quant your PC holds:** every model's list (GLM-5.3-Flash, GLM-5.3 (744B), DeepSeek and MiniMax) now recommends the largest quant, no larger than the model's usual pick, whose files plus the default context's cache fit in your VRAM and RAM together (with 6 GB left for the system), so no expert has to be read from the SSD while it answers. When less than a fifth of it would be in GPU memory, the next smaller one is recommended; when none fits, the smallest. An AMD Ryzen AI Max APU (Strix / Gorgon Halo) and a Mac count their shared memory once. Every quant stays in the list, and ids, names and downloads are unchanged. For GLM-5.3 (744B) the recommendation is at most GLM-5.3-Maya-XS; the larger quants stay listed.
+- **GLM-5.3 (744B) on unified-memory APUs: a context that keeps the whole model in memory:** on an AMD Ryzen AI Max APU the setup recommends the largest context whose cache still leaves room for all of the model in memory, and says so in one line. A longer context, given with `--context` or chosen by an earlier setup, is kept, with a warning that some experts are then read from the SSD.
+- **Turbo for GLM-5.3 (744B):** the Turbo button is now offered for GLM-5.3 too, with its own setting: when a token's experts are chosen, the ones already in VRAM are preferred (`MAYA_GLM_ROUTE_AFFINITY=0.2`), and the context is set to 32K. With GLM-5.3-Maya-XS, part of it outside VRAM, this decoded about 22-25% faster than without it on our test PC. Like every Turbo setting it changes the answers; it stays off until you switch it on, and switching it off restores your settings exactly. GLM-5.3-Flash's Turbo is unchanged.
+- **Dashboard: "Saved" for chat defaults:** Settings > Chat defaults shows a small "Saved" tick beside its title after every change.
+- **Refusal ablation for DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash and GLM-5.3-Flash:** Maya's own direction files are now in each model's repo; the setup downloads the model's file and the Models page shows its switch. It is off until you switch it on (the Models page, or a request's `"ablate"`), and with it off the answers are the same as before. On our held-out test prompts the share of refused requests went from 98% to 1% (DeepSeek), 100% to 7% (MiniMax) and 100% to 4% (GLM-5.3-Flash), with no more refusals of ordinary requests than without it. Fitting your own direction with `tools/ablate_fit.py` now works on MiniMax (it stopped with an error before) and gives a usable direction on GLM-5.3.
+- **Fixes:**
+  - GLM-5.3 (744B) and GLM-5.3-Flash keep their own chat defaults on the dashboard: changing one no longer changes the other. GLM-5.3 starts once from the values you saved before.
+  - `--parallel` with fair slices (`MAYA_FAIR_SLICE_S`): one waiting request now pauses one running answer instead of every running answer, so the others keep going (thanks to @HTsulfuric, #883).
+  - DeepSeek with `DS4_LENT_RAM_GB`: a failed copy into the RAM copies no longer makes every request fail with HTTP 400; the copies turn themselves off and prompts run as they do without the setting, with the same answers (#884).
+  - DeepSeek on NVIDIA tensor-parallel pairs: `MAYA_DS4_HIP_PEER_AR=auto` / `1` reaches the direct GPU-to-GPU prompt all-reduce again, as in v1.1.54 (since v1.1.55 it was skipped whenever `MAYA_DS4_AR2` was not set); `auto` compares the transports at startup as before. The answers are the same.
+
 ## v1.1.58 - 2026-11-10
 
 GLM-5.3-Maya-XS, Maya's own quant of GLM-5.3 (744B) at 170 GB, faster GLM-5.3 decode and drafting, DeepSeek's one-GPU decode back to speed (#920), and fixes.

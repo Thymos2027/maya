@@ -28,8 +28,8 @@ PROGRESS = re.compile(r"([\d.]+) / ([\d.]+) GB(?: \((\d+)%\))?(?: · ([\d.]+) MB
 # by its name): (catalog id, family, the setup's key, who made them).  The Models page lists them under "Other quants".
 # Left out as the setup's own list leaves them out: DeepSeek's UD-Q4_K_XL (maya.DS4_BY_HAND) and GLM's
 # EXL3-sc_4.10bpw (maya.MODELS_BY_HAND) - a command line still takes them.
-DS4_OTHER = (("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"), ("gguf-iq1_s", "unsloth"),
-             ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
+DS4_OTHER = (("exl3-2.25", "turboderp"), ("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"),
+             ("gguf-iq1_s", "unsloth"), ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
              ("gguf-iq3_xxs", "unsloth"), ("gguf-iq3_s", "unsloth"), ("gguf-q3_k_xl", "unsloth"),
              ("abliterated-128g", "orcarouter"), ("abliterated-256g", "orcarouter"))
 GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
@@ -103,14 +103,22 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
         if isinstance(c.get("installer"), dict):
             have.add((Q.family_of(c), str(Q.config_key(c))))
     sizes = glm_sizes if glm_sizes is not None else _glm_sizes()
+    backend = (cfg or {}).get("backend") or "cuda"
+    ccs = _nvidia_ccs(backend) if ccs is None else ccs
+    # Hy4-Flash (maya-hy4): the sizes that are uploaded, on NVIDIA from V100 on only (no AMD or Mac engine yet)
+    hy4 = _hy4_downloads() if backend not in ("hip", "metal") and (not ccs or max(ccs) >= HY4_MIN_CC) else {}
     out = []
     for fam, key, _tier, ident in Q.QUANTS:
+        if fam == "hy4":
+            if key in hy4:
+                out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya",
+                            "note": "text only", "installed": (fam, key) in have,
+                            "size_gb": round(float(hy4[key]["download_gb"]), 1) if hy4[key].get("download_gb") else None})
+            continue
         out.append({"id": ident, "family": fam, "name": Q.shown(fam, key), "group": "maya", "by": "Maya", "note": "",
                     "installed": (fam, key) in have, "size_gb": sizes.get(key)})
     out.append({"id": "cyber-frost", "family": "qwen", "name": Q.shown("qwen", "q5_k_m"), "group": "maya",
                 "by": "peasantsmith", "note": "", "installed": ("qwen", "q5_k_m") in have, "size_gb": None})
-    backend = (cfg or {}).get("backend") or "cuda"
-    ccs = _nvidia_ccs(backend) if ccs is None else ccs
     extra = other_sizes if other_sizes is not None else (_other_sizes() if glm_sizes is None else {})
     for ident, fam, key, by in OTHER:
         if not _offered(fam, key, backend, ccs):
@@ -141,6 +149,20 @@ def _g53_downloads() -> dict:
         import maya                                    # (the setup's own table; nothing runs on import)
         return dict(maya.G53_MODELS)
     except Exception:  # noqa: BLE001 - a catalog entry is a nicety
+        return {}
+
+
+HY4_MIN_CC = 70                                      # (maya.HY4_MIN_CC: maya-hy4's kernels, V100 on)
+
+
+def _hy4_downloads() -> dict:
+    """Hy4-Flash's downloads, by the setup's key ("maya-xs"): the sizes whose files are uploaded (maya.hy4_published),
+    each as maya.hy4_entry says it - a size is listed the day its files are, by the setup's data alone."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        import maya                                    # (the setup's own table; nothing runs on import)
+        return {k: maya.hy4_entry(k) for k in maya.HY4_QUANTS if maya.hy4_published(k)}
+    except (Exception, SystemExit):  # noqa: BLE001 - a manifest not readable: not offered
         return {}
 
 

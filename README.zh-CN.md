@@ -4,7 +4,7 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>在你自己的 GPU 上运行 GLM-5.3 (744 B)、GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B) 和 MiniMax-M3.1-Flash (428 B)</b><br>
+<p align="center"><b>在你自己的 GPU 上运行 GLM-5.3 (744 B)、GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B) 和 Hy4-Flash (220 B)</b><br>
 私密且快速 · 1 块到最多 16 块 NVIDIA GPU · 支持 AMD 和 Windows · 聊天、图片、兼容 OpenAI 和 Anthropic 的 API · 同时处理多个请求</p>
 
 <p align="center">
@@ -13,6 +13,7 @@
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm-m-derisked.svg" alt="GLM-5.3-Flash Maya-M-Derisked downloads"></a>
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/deepseek.svg" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/minimax.svg" alt="MiniMax-M3.1-Flash Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/hy4.svg" alt="Hy4-Flash Maya downloads"></a>
 </p>
 
 <p align="center">由 <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>) 创建并主导，与 <b><a href="https://github.com/needmorevram">@needmorevram</a></b> 共同维护</p>
@@ -21,14 +22,14 @@
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <sub>Project Maya 是免费的。如果它在你的电脑上运行良好，欢迎赞助，用于购买测试硬件和支持开发。</sub></p>
 
-这么大的模型通常需要数据中心。Maya 让你用手头现有的硬件运行其中四个：
-**GLM-5.3**、**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017** 和 **MiniMax-M3.1-Flash**。每个模型都有专门为它打造的引擎。引擎把你的对话最常用的专家 (experts) 放在 GPU 上，接下来会用到的放在内存里，其余的放在 NVMe 固态硬盘上，并随着聊天不断调整。它会测量你的 GPU、CPU、内存和固态硬盘并自动调优。数据不会离开你的机器。
+这么大的模型通常需要数据中心。Maya 让你用手头现有的硬件运行其中五个：
+**GLM-5.3**、**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017**、**MiniMax-M3.1-Flash** 和 **Hy4-Flash**。每个模型都有专门为它打造的引擎。引擎把你的对话最常用的专家 (experts) 放在 GPU 上，接下来会用到的放在内存里，其余的放在 NVMe 固态硬盘上，并随着聊天不断调整。它会测量你的 GPU、CPU、内存和固态硬盘并自动调优。数据不会离开你的机器。
 
 - **快：** 两块 RTX 5090 加一块 RTX 4090 最高 149 tokens/s，两块 H100 为 124，四块 RTX 4090 为 118，一块 RTX PRO 6000 为 81，单块 RTX 5090 也能达到 30 以上。[真实用户的实测数据](#how-fast-is-it)。
 - **接近原版：** Maya 自己的 GLM-5.3-Flash 量化版本保留了 FP8 模型零样本准确率的 97.7-99.2%；DeepSeek V4.1 · Maya-S 与原版选择相同下一个 token 的概率为 92.6%，MiniMax M3.1 · Maya-S 为 87.6% (各类别平均值)。
 - **接入你的工具：** 兼容 OpenAI 和 Anthropic 的 API，支持工具调用，可直接用于编程智能体。
 - **同时处理多个请求：** GLM-5.3-Flash、DeepSeek-V4.1-Flash 和 MiniMax-M3.1-Flash 最多可同时回答 8 个请求，适合运行多个会话的智能体，或多人共用一台电脑。
-- **开箱即用：** 浏览器里的聊天和实时监控、所有模型都支持图片、思考级别、可下载 / 加载 / 删除模型的 Models 页面、Turbo 按钮，以及一条命令完成的安装。
+- **开箱即用：** 浏览器里的聊天和实时监控、能读图的模型都支持图片、思考级别、可下载 / 加载 / 删除模型的 Models 页面、Turbo 按钮，以及一条命令完成的安装。
 
 ## <a name="quick-start"></a>快速开始
 
@@ -59,10 +60,11 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 整个模型装进 128 GB 电脑的内存 (Engram 表留在固态硬盘上)；v2 比 v1 更接近原版约 12%，写作速度快约 20% - 再次运行安装程序会提示更新 |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>腾讯 · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 最长 1M 上下文 · 支持图片 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>各加一个共用的 63.4 GB n-gram 表 | 内存与显存合计约 56-64 GB (Maya-XS，8 GB 及以上的显卡)、68-80 GB (Maya-S)、80-96 GB (Maya-M) 或 104-128 GB (Maya-L) 的电脑；Maya-S、Maya-M 和 Maya-L 需要 12 GB 及以上的显卡；n-gram 表留在固态硬盘上 |
 
 **哪个模型适合你的电脑？** 请看 [docs/MEMORY.md](docs/MEMORY.md)，里面有每个模型的推荐内存（VRAM 与 RAM 合计）。
 
-它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
+它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))；Hy4-Flash 支持 NVIDIA (Linux 和 Windows) 以及 Linux 上的 AMD (Strix Halo / Gorgon Halo、Radeon 显卡)，在能运行它的每块显卡上都能读取图片 (包括 8 GB 显卡)。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF、turboderp 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>质量
 
@@ -71,6 +73,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **GLM-5.3-Flash · Maya 量化**保留了 FP8 模型零样本准确率的 97.7-99.2%，下一个 token 与原版一致的比例为 83-90% (Maya-L：99.2%，90%)。制作与测量方法：[MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
 - **DeepSeek V4.1 · Maya-S** 与原版选择相同下一个 token 的概率为 92.6%。
 - **MiniMax M3.1 · Maya-S** 为 87.6% (各类别平均值)。
+- **Hy4-Flash · Maya 量化** 为 88.5% (Maya-XS) 到 96.6% (Maya-L)，KL 散度从 0.16 降到 0.012；与腾讯自己的 GGUF 的对比图见[模型卡](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)。
 
 更多内容见各模型在 [Hugging Face](https://huggingface.co/peasantsmith) 上的模型卡。
 
@@ -91,9 +94,11 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **RTX PRO 6000 Blackwell 96 GB**, Ryzen 7 9800X3D, 61 GB RAM | Maya-M, 256K context | **81.0 tokens/s** | 3102 tokens/s | @yundddd (v1.1.7, #172) |
 | **4x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2630 v4, 126-504 GB RAM, SATA SSD | Maya-S / Maya-M / Maya-L, 32K context | **69.7 / 67.2 / 43.3 tokens/s** | 730 / 713 / 627 tokens/s | @HansStrupat (v1.1.36, #327, #340, #653) |
 | **4x Tesla V100-SXM2 32 GB** (NVLink 2.0) | Maya-S, 32K context | 68.4 tokens/s | 549 tokens/s | @jeremiahlangner (v1.1.18, #333) |
+| **4x Tesla V100-SXM2 16 GB**, Xeon E5-2643 v4, 63 GB RAM | Maya-XS, 128K context | 64.0 tokens/s (after `--calibrate`) | 596 tokens/s | @atollerus-tm (v1.1.63, #997) |
 | **1x H100 80 GB** (PCIe 5.0 x16), Xeon Platinum 8488C, 504 GB RAM | Maya-M-Derisked, 1M context | 61.4 tokens/s | 2014 tokens/s | @Molyleaf (v1.1.15, #260) |
 | **2x NVIDIA CMP 170HX 64 GB** (PCIe Gen2 x4 each), 2x Xeon E5-2690 v4, 91 GB RAM | Maya-M, every expert in VRAM | 61.3 tokens/s | 514 tokens/s | @ZackO2o (v1.0.6, #22) |
 | **2x RTX A6000 48 GB** (PCIe 4.0 x8), Core i9-13900K, 128 GB RAM, SATA SSD | Maya-S / Maya-M / Maya-L, 131K-token prompts | 60.7 / 50.9 / 32.1 tokens/s | 1726 / 1629 / 1298 tokens/s (131K) | @everson (v1.1.20, #371) |
+| **4x RTX 4090 24 GB** (PCIe 4.0 x16), Xeon Platinum 8380, 251 GB RAM, SATA SSD | Maya-L, 1M context | **60.6 tokens/s** | 1458 tokens/s (654 at 2K) | @oscarlius (v1.1.57, #938) |
 | **2x RX 7900 XTX 24 GB** (PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB) | Maya-M, up to 512K context | 56.0 tokens/s (50.1 after a 456K-token prompt) | 907 tokens/s (114K) | @pepuscz (v1.1.25 + #454-#457, #458) |
 | **2x RTX 5880 Ada 45 GB** (PCIe 4.0 x16), Xeon Gold 5420+, 393 GB RAM | Maya-L, 256K context | 54.5 tokens/s | 1401 tokens/s | @vjsyong (v1.1.4, #149) |
 | **2x NVIDIA CMP 170HX 40 GB** (PCIe Gen2 x16 each), Xeon w3-2423, 128 GB DDR5 | Maya-S, 128K context | 54.3 tokens/s | 831 tokens/s | @nvsofts (v1.1.15, #263) |
@@ -102,6 +107,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **3x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v3, 128 GB DDR3L, Windows 10 | Maya-S, 128K context | 52.9 tokens/s | 616 tokens/s | @noahark (v1.1.20, #346) |
 | **RTX PRO 6000 Blackwell 96 GB** (PCIe 5.0 x16), Ryzen 9 9950X3D, 253 GB RAM, Windows 11 | Maya-L, 512K context | 48.8 tokens/s | 3810 tokens/s | @Andrey0710 (v1.1.43, #730) |
 | **4x Tesla V100 32 GB** (PCIe 3.0 x16), 24 CPU cores, a 100 GiB RAM limit | Maya-L, 32K context | 48.3 tokens/s (after `--calibrate`) | 499 tokens/s | @areslp (v1.1.3, [#130](https://github.com/mw00/project-maya/issues/130)) |
+| **2x Radeon AI PRO R9700 32 GB** (gfx1201), Core i5-13500, 96 GB DDR5 | Maya-S, 128K context | 45.2 tokens/s | 848 tokens/s | @rim-jaynor (v1.1.57, #942) |
 | **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 4.0 x16 each, 240 W), EPYC 7313, 256 GB RAM | Maya-M-Derisked, 256K context | 44.4 tokens/s | 703 tokens/s | @knoodrake (v1.1.28, #509) |
 | **4x RTX 3090 24 GB** (PCIe 4.0 x8 behind one switch), Xeon Platinum 8260M, 376 GB RAM | Maya-L, 1M context | 44.2 tokens/s (tuned) | 698 tokens/s | @foureight84 (v1.1.17, #302) |
 | **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 4.0 x8 each), Ryzen 5 3600, 64 GB RAM | Maya-S24 / Maya-M-Derisked, 256K context | 44.1 / 24.9 tokens/s | 704 / 617 tokens/s | @gegnep (v1.1.20, #395) |
@@ -111,8 +117,10 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-S24 | 40.5 tokens/s | 1271 tokens/s | @fuad00 (v1.1.0, #122) |
 | **RTX PRO 6000 Blackwell 96 GB** (PCIe 4.0 x16), Ryzen 5 5600, 92 GB DDR4 | Maya-L, 1M context | 39.6 tokens/s | 2708 tokens/s (3246 warm) | @QueTensors (v1.1.28, #532) |
 | **4x Tesla T10 15 GB** (PCIe 3.0 x16), Xeon E5-2680 v4, 63 GB RAM | Maya-S24, 100K context | 38.4 tokens/s | 393 tokens/s | @zeallag (v1.1.16, #291) |
+| **2x Tesla V100 32 GB** (PCIe 3.0 x16 each, power-capped at 150 W), EPYC 7V12, 256 GB DDR4-3200 | Maya-L, 128K context | 34.9 tokens/s (after `--calibrate`) | 589 tokens/s | @scranst (v1.1.52, #939) |
 | **2x Tesla V100 32 GB** (PCIe 3.0 x8 each), Ryzen 9 7945HX3D, 96 GB RAM | Maya-M / Maya-L | 33.8 / 13.3 tokens/s | 490 / 372 tokens/s | @nkhaooat (v1.1.11, #208) |
 | **RTX 3090 24 GB + RTX 3060 12 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 33.7 tokens/s | 682 tokens/s | @erikash (v1.1.4, #157) |
+| **2x RX 9070 16 GB** (gfx1201, PCIe x8 each), Ryzen 9 9950X, 89 GB RAM | Maya-S24, 128K context, tuned | 33.0 tokens/s | 562 tokens/s | @bob-u (v1.1.56, #934) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | Maya-S, 32K context | 31.5 tokens/s | 342 tokens/s | @tobitege (v1.1.37, #663) |
 | **RTX 5090 32 GB**, Ryzen 9 7950X, 96 GB DDR5 | Maya-M | 30+ tokens/s | ~2000 tokens/s | @siganos (#43) |
 | **2x RTX 3090 24 GB** (PCIe 4.0 x16, NVLink), Threadripper PRO 3955WX, 247 GB RAM | EXL3-3.05bpw, 128K context | 29.2 tokens/s | - | @catonooka (v1.1.9, #187) |
@@ -136,10 +144,12 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **AMD Radeon 8060S** (Ryzen AI Max+ 395, 128 GB, 96 GB of it for the GPU), Windows 11 | Maya-S | 18.3 tokens/s | 320 tokens/s | @LIN-LAB-AI (v1.0.30, #102) |
 | **RTX 3090 Ti 24 GB** (PCIe 3.0 x16, a VM), EPYC 7302P, 240 GB RAM | Maya-L, 32K context | 18.2 tokens/s (tuned, #177) | 791 tokens/s | @Jw88888 (v1.1.7, #177) |
 | **3x Tesla P100 16 GB** (Pascal; PCIe 3.0 x8, 3.0 x8, 2.0 x4), Ryzen 5 2600, 64 GB RAM | Maya-S24, 64K context | 17.9 tokens/s | 105 tokens/s | @maxlawrie (v1.1.28 + #479, #504) |
+| **2x RX 6800 16 GB** (gfx1030, PCIe 3.0 x16 each), Core i9-7980XE, 256 GB DDR4-2666 | Maya-L, 1M context | 16.7 tokens/s | 195 tokens/s | @digitalhomesteader (v1.1.56, #895) |
 | **RTX 4090 24 GB**, Ryzen 7 9700X, 64 GB RAM | Maya-S24, 32K context | 16.6 tokens/s | 1320 tokens/s | @MagikEh (#274) |
 | **RTX 5070 12 GB** (PCIe 4.0 x16), EPYC 7302 (4-channel DDR4), 126 GB RAM | Maya-S24, 64K context | 16.6 tokens/s | 323 tokens/s | @hugou74130 (v1.1.45, #755) |
 | **NVIDIA DGX Spark** (GB10, 121 GB unified memory) | Maya-S, 128K context | 16.5 tokens/s | ~730 tokens/s (6K prompt) | @ericoh88 (v1.1.15, #282) |
 | **RTX 4090 24 GB**, Ryzen 9 9950X3D, 192 GB DDR5, Windows 11 | Maya-L, 128K context | 16.4 tokens/s | 1371 tokens/s | @npc97 (v1.0.24, #63) |
+| **RTX A4000 16 GB** (power-capped at 110 W), Core i7-14700, 64 GB DDR5-5600 | Maya-XS, 256K context, a real coding session | 15.2 tokens/s (15.6 at 32K) | 573 tokens/s (21K-token prompt) | @kai-r (v1.1.64, #999) |
 | **RTX 5090 Laptop 24 GB**, Core Ultra 9 275HX, 64 GB RAM, Windows 11 (a laptop) | Maya-S24 | 14.5 tokens/s | 994 tokens/s | @klvnblst (v1.0.30, #67) |
 | **2x RTX 4060 Ti 16 GB** (PCIe 3.0 x8 each), Core i7-10700K, 128 GB DDR4, SATA SSD | UD-IQ3_XXS, 128K context | 13.0 tokens/s | 385 tokens/s | @oisee (v1.1.42, #723) |
 
@@ -161,16 +171,20 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **4x AMD Instinct MI100 32 GB** (gfx908, PCIe 4.0 x16 each), EPYC 7402, 252 GB RAM | Maya-XS, 32K context | 51.8 tokens/s | 172 tokens/s | @nsaxploit (v1.1.22, #396) |
 | **4x RTX 3090 24 GB** (PCIe 3.0, SM clocks capped at 1500 MHz), Threadripper 1950X, 126 GB RAM | Maya-S, 256K context | 50-53 tokens/s (code), 40-43 (prose) | 947 tokens/s (10K), 1954 (90K) | @mgabor3141 (v1.1.26, #448) |
 | **2x NVIDIA A40 48 GB** (PCIe 4.0 x16), 2x Xeon Gold 6330, 256 GB RAM, Windows Server 2022 | Maya-S, 256K context | 48.9 tokens/s (tuned) | ~660 tokens/s (3K) | @yjyz1011 (v1.1.28, #508) |
+| **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | turboderp EXL3 2.25 bpw, 1M context, DSpark | 48.6 tokens/s | 650 tokens/s (8K) | @pepuscz (v1.1.56, #905) |
 | **2x RTX PRO 6000 Blackwell 96 GB** (tensor parallel 2, PCIe 5.0), Core Ultra 7 270K Plus, 188 GB DDR5 | UD-Q8_K_XL, 1M context, DSpark | 48.3 tokens/s | 1245 tokens/s (3360 at 48K) | v1.1.51, #819 |
 | **RTX 4090 24 GB** (PCIe 4.0 x8), Ryzen 9 9950X3D, 192 GB DDR5 | Maya-XS, 64K context | 44.1 tokens/s | 539 tokens/s | @naeq (v1.1.27, #503) |
 | **4x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2630 v4, 504 GB RAM | Maya-S / UD-Q4_K_XL / UD-Q8_K_XL, 64K context | 44.0 / 28.6 / 29.7 tokens/s | 592 / 236 / 233 tokens/s | @HansStrupat (v1.1.49, #785) |
+| **RX 7900 XTX 24 GB** (PCIe 4.0 x4) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | turboderp EXL3 2.25 bpw, 1M context, DSpark | 43.3 tokens/s | 371 tokens/s (8K) | @pepuscz (v1.1.56, #908) |
 | **1x L40S 48 GB** (vGPU), Xeon Platinum 8580 (a VM, 32 vCPUs), 504 GB RAM | UD-Q8_K_XL, 256K context | 43.2 tokens/s | 1862 tokens/s (174K) | @talisp (v1.1.32, #577) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | orcarouter abliterated Mix-128G, 256K context, DSpark | 43.2 tokens/s | 453 tokens/s | @tobitege (v1.1.37, #663) |
 | **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | Maya-S, 512K context, `DS4_INDEX_TC=1` | 41.7 tokens/s (49.4 after a 130K-token prompt, cached) | 1378 tokens/s (130K; 478 at 8K) | @pepuscz (v1.1.48 + #801, #797) |
 | **4x RTX 3090 24 GB** (PCIe 4.0 x16), Threadripper PRO 3975WX, 502 GB RAM | UD-Q8_K_XL, 256K context | 37.1 tokens/s | 596 tokens/s | @bandito1 (v1.1.50, #766) |
 | **4x RX 7900 XT 20 GB** (gfx1100, `--tp 4`, tuned), 2x Xeon E5-2699C v4 (a Dell T7910), 1 TB DDR4-2400 | UD-Q4_K_XL | 35.0 tokens/s | - | @Cass67 (v1.1.32, #566) |
+| **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 3.0 x16 each), Xeon E5-2690 v4, 126 GB RAM | Maya-XS, 256K context | 34.0 tokens/s | 444 tokens/s | @imaginitivename (v1.1.55, #890) |
 | **2x RTX 3090 24 GB** (PCIe 4.0 x8, 270 W), Core Ultra 7 265K, 192 GB DDR5 | Maya-S, 1M context, tuned | 33.3 tokens/s | 467 tokens/s | @Jellepepe (v1.1.35, #614) |
 | **2x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v4, 128 GB DDR3-1866 | Maya-XS (v2), 256K context, DSpark | 32.0 tokens/s | 420 tokens/s | @c200762620-max (v1.1.51, #815) |
+| **Tesla V100 32 GB** (PCIe 3.0 x16, power-capped at 150 W), Xeon E5-2680 v4, 128 GB DDR4-2400 | Maya-XS (v2) | 24.5 tokens/s | 510 tokens/s after `--calibrate` (355 before) | @wairentiun (v1.1.61, #978) |
 | **3x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v3, 128 GB DDR3L, Windows 10 | Maya-S, 64K context | 23-26 tokens/s (long answers) | 377 tokens/s | @noahark (v1.1.26, #450) |
 | **2x RTX 2080 Ti 22 GB** (modded, PCIe 3.0 x16, power-capped at 250 W), 2x Xeon E5-2696 v4, 94 GB RAM | Maya-XS, 128K context | 23.1 tokens/s | 317 tokens/s | @NorwinYu (v1.1.36, #659) |
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-XS, 64K context | 21.5 tokens/s | 573 tokens/s | @fuad00 (v1.1.22, #393) |
@@ -184,12 +198,21 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 
 | 机器 | 模型 | 解码 (写出回答) | 预填充 (读取提示) | 提交者 |
 | --- | --- | ---: | ---: | --- |
+| **RTX PRO 6000 Blackwell 96 GB** (PCIe 5.0 x16), Ryzen 9 9950X3D, 253 GB RAM, Windows 11 | Maya-XS, 256K context, DSpark, refusal ablation on | **78.4 tokens/s** | 1186 tokens/s (1332 at 2K) | @Andrey0710 (v1.1.64, #1005) |
 | **RTX PRO 6000 Blackwell 96 GB** (PCIe 5.0 x16), Ryzen 9 9950X3D, 253 GB RAM, Windows 11 | Maya-S, 256K context, DSpark | **48.6 tokens/s** | 757 tokens/s | @Andrey0710 (v1.1.43, #738) |
 | **RTX 3090 24 GB + 8x RTX 5060 Ti 16 GB** (PCIe 3.0 x8 each), 183 GB RAM | EXL3 3.5 bpw, tensor parallel 4 + DSpark, 8K context | 38.2 tokens/s (code), 32.4 (prose) | - | @needmorevram (#477) |
 | **1x L40S 48 GB** (vGPU), Xeon Platinum 8580 (a VM, 32 vCPUs), 504 GB RAM | Maya-S / EXL3 3.55 bpw, 256K context | 23.4 / 16.7 tokens/s | 332 / 273 tokens/s (158K) | @talisp (v1.1.32, #577) |
 | **2x RTX 3090 24 GB** (power-capped at 230 W), EPYC 7543 (a VM, 32 vCPUs), 224 GB RAM | Maya-S, 200K context, DSpark | 22.0 tokens/s (code), 18.4 (prose) | 163 tokens/s (10K) | @noonghunna (v1.1.30, #549) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | Maya-S, 128K context, DSpark | 21.0 tokens/s | 139 tokens/s | @tobitege (v1.1.37, #663) |
 | **2x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v4, 128 GB DDR3-1866 | Maya-XS, 256K context, DSpark | 14.5 tokens/s | 254 tokens/s | @c200762620-max (v1.1.51, #816) |
+
+</details>
+
+<details><summary><b>Hy4-Flash 速度基准</b></summary>
+
+| 机器 | 模型 | 解码 (写出回答) | 预填充 (读取提示) | 提交者 |
+| --- | --- | ---: | ---: | --- |
+| **3x Tesla V100 32 GB** (各 PCIe 3.0 x16)、2x Xeon Gold 6138、183 GB 内存 | Maya-XS / Maya-S，32K 上下文，MTP 草稿 | **88.7 / 84.2 tokens/s** | 1607 / 1566 tokens/s | 维护者 (v1.1.68) |
 
 </details>
 
@@ -206,7 +229,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **模型 API：** `/api/tags`、`/api/ps`、`/api/show`、`/api/chat`、`/api/generate`、`/api/pull` 和 `/api/delete` 可让任何应用或脚本列出、加载、下载和删除模型。请求一个尚未加载的模型会切换到它，`keep_alive` 会在空闲时卸载它。`/models/load`、`/models/unload` 和 `/models/sse` 也默认开启 (`"model_management": false` 可关闭)。
 - **思考：** Off、Low、High (默认) 或 Max，可在设置中或按请求指定；还有一个**思考预算**字段，设置模型在回答前最多可以思考多少个 token。
 - **循环防护：** 默认开启 - 当智能体用同样的结果反复发出同一个工具调用时，会被引导走出循环。
-- **图片：** 在聊天中附加，或通过任一 API 发送图片内容。每个模型都能读取图片 (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
+- **图片：** 在聊天中附加，或通过任一 API 发送图片内容。除 GLM-5.3 仅文本外，每个模型都能读取图片 (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
 - **MCP 工具：** 在配置中列出 MCP 服务器 (`"mcp_servers"`；Claude Desktop 的 `mcpServers` 块可原样使用)，网页聊天中的模型就能调用它们的工具。聊天的 **+** 菜单里有开关。具体行为见 [serve/mcp.py](serve/mcp.py)。
 - **Docker：** 没有官方镜像。[docs/DOCKER.md](docs/DOCKER.md) 是基于某个发布版本构建镜像的方法。
 - **从其他设备访问：** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。务必设置密钥。
@@ -217,9 +240,9 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA，计算能力 7.0 或更高 (V100、RTX 20 及更新)：1 块，或最多 16 块共同承载模型。显存越大越快。Pascal (Tesla P40 / P100、GTX 10) 为实验性，尚未验证。**AMD：** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo 和 Gorgon Halo (Radeon 8060S / 8065S)；RX 6800 / 6900 和 Radeon PRO V620 / W6800 尚未验证；GLM-5.3-Flash 和 DeepSeek-V4.1-Flash-1017 在 AMD 上也能读取图片 - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
+| **GPU** | NVIDIA，计算能力 7.0 或更高 (V100、RTX 20 及更新)：1 块，或最多 16 块共同承载模型。显存越大越快。Pascal (Tesla P40 / P100、GTX 10) 为实验性，尚未验证。**AMD：** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo 和 Gorgon Halo (Radeon 8060S / 8065S)；RX 6800 / 6900 和 Radeon PRO V620 / W6800 尚未验证；GLM-5.3-Flash、DeepSeek-V4.1-Flash-1017 和 Hy4-Flash 在 AMD 上也能读取图片 - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **内存** | 32 GB 即可运行。内存越多，能让更多专家就近存放，速度也越快 |
-| **磁盘** | **一块高速 NVMe 固态硬盘**，空间足够放下模型 (GLM-5.3-Flash · Maya-XS 约 75 GB、GLM-5.3-Flash · Maya-S 约 100 GB、GLM-5.3-Flash · Maya-L 约 160 GB、DeepSeek V4.1 · Maya-S 约 350 GB、其 unsloth Q8 GGUF 约 470 GB、MiniMax M3.1 · Maya-XS 约 95 GB、MiniMax-M3.1-Flash 的 EXL3 量化约 200 GB)，外加它的图片编码器 (1.1 GB)。不能用机械硬盘 |
+| **磁盘** | **一块高速 NVMe 固态硬盘**，空间足够放下模型 (GLM-5.3-Flash · Maya-XS 约 75 GB、GLM-5.3-Flash · Maya-S 约 100 GB、GLM-5.3-Flash · Maya-L 约 160 GB、DeepSeek V4.1 · Maya-S 约 350 GB、其 unsloth Q8 GGUF 约 470 GB、MiniMax M3.1 · Maya-XS 约 95 GB、Hy4-Flash · Maya-XS 约 110 GB、MiniMax-M3.1-Flash 的 EXL3 量化约 200 GB)，外加它的图片编码器 (1.1 GB)。不能用机械硬盘 |
 | **系统** | Linux (x86-64；最好带 AVX2 的 CPU)、NVIDIA 驱动、CUDA 12.x (CUDA 13 适用于 RTX 20 及更新，不适用于 V100 或 Pascal)、g++、Python 3.10+。Windows 10/11：[docs/WINDOWS.md](docs/WINDOWS.md)。不支持 WSL2。AMD：ROCm 7 |
 
 安装程序会检查以上所有项目，对缺少的内容打印出确切的命令，并且不会在系统范围内安装任何东西。
@@ -264,7 +287,7 @@ Project Maya 免费且开源。每个版本在发布前都会在我们自己的 
 - **人员：** Project Maya 由 Peasant Smith ([@mw00](https://github.com/mw00)、[X](https://x.com/PeasantSmith)) 创建并主导，他拥有该项目、其名称和 Maya 模型。[@needmorevram](https://github.com/needmorevram) ([X](https://x.com/needmorevram)) 是共同维护者，贡献了主要功能：DFlash2 草稿、EXL3 支持、KV 流式传输、会话检查点、层拆分搜索、专家画像和 CPU 专家内核，以及为 `maya-ds4` 贡献的 3.5 位 EXL3 选项、4 / 8 块 GPU 上的张量并行和多线程的专家缓存交换 (#276)。同时感谢所有贡献代码和速度报告的人 ([贡献者](https://github.com/mw00/project-maya/graphs/contributors))。
 - **基于 [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT License，Copyright (c) 2023-2026 The ggml authors)：量化格式、CPU 点积以及提示处理路径的 MMQ 内核，均由固定的提交构建 (`third_party/ggml/LICENSE`)。
 - **EXL3 支持**遵循 [exllamav3](https://github.com/turboderp-org/exllamav3) 的格式、码本、CPU 专家内核和分块的张量核心解码 (MIT License，Copyright (c) 2025 Turboderp；`third_party/exllamav3/LICENSE`)。**DFlash2 草稿模型的前向计算**遵循 [beellama.cpp](https://github.com/Anbeeld/beellama.cpp) 的实现 (MIT License，Copyright (c) 2023-2026 The ggml authors、Anbeeld；`third_party/beellama.cpp/LICENSE`)。
-- 模型：[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) 来自 zai-org (MIT)；Maya 的量化版本和图片编码器文件由 zai-org 公开发布的权重制作，沿用其许可证。[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) 来自 DeepSeek (MIT)；Maya 的量化版本、其 Engram 表和草稿模型由 DeepSeek 公开发布的权重制作，沿用其许可证；视觉塔来自 DeepSeek 的检查点，GGUF 选项来自 [unsloth 的 GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)，EXL3 选项来自 LibertAIDAI ([2.9](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) 和 [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw))。可选的 DFlash2 草稿模型 ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF)，作者 Anbeeld) 采用 CC BY-NC-ND 4.0，仅限非商业使用，只有在你选择时才会下载。
+- 模型：[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) 来自 zai-org (MIT)；Maya 的量化版本和图片编码器文件由 zai-org 公开发布的权重制作，沿用其许可证。[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) 来自 DeepSeek (MIT)；Maya 的量化版本、其 Engram 表和草稿模型由 DeepSeek 公开发布的权重制作，沿用其许可证；视觉塔来自 DeepSeek 的检查点，GGUF 选项来自 [unsloth 的 GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)，EXL3 选项来自 turboderp ([2.25 bpw](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3/tree/2.25bpw)) 和 LibertAIDAI ([2.9](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) 和 [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw))。可选的 DFlash2 草稿模型 ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF)，作者 Anbeeld) 采用 CC BY-NC-ND 4.0，仅限非商业使用，只有在你选择时才会下载。
 - 仪表盘的字体：Outfit (SIL Open Font License 1.1，`serve/web/fonts/OFL.txt`)；图标：[Lucide](https://lucide.dev) (ISC License，`serve/web/LICENSE.lucide.txt`)；UI 库：[Preact](https://preactjs.com) (MIT License) 和 [htm](https://github.com/developit/htm) (Apache License 2.0)，连同它们的声明一起打包在 `serve/web/preact.js` 中。
 - Maya 以 [MIT License](LICENSE) 开源；[LICENSE](LICENSE) 和 `third_party/` 中的声明会随每份副本保留。
 

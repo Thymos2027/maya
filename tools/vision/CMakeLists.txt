@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
 
-# Maya's build options by the names its docs give them: -DMAYA_X=... sets STRATA_X, the name this file reads
+# Maya's build options by the names its docs give them: -DMAYA_X=... sets MAYA_X, the name this file reads
 get_cmake_property(_maya_cache CACHE_VARIABLES)
 foreach(_v IN LISTS _maya_cache)
   if(_v MATCHES "^MAYA_(.+)$")
@@ -61,6 +61,9 @@ if(STRATA_VISION_HIP)
 endif()
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
+if(MSVC AND TARGET ggml-cuda)
+  target_compile_options(ggml-cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+endif()
 # float32 sums for the encoder's matmuls and attention on the GPU (ggml_vision_precision.py): on maya-vision's own
 # ggml only - the engines compile the same ggml files without it
 foreach(_t ggml-cuda ggml-hip)
@@ -70,6 +73,9 @@ foreach(_t ggml-cuda ggml-hip)
 endforeach()
 
 add_executable(maya-vision strata_vision.cpp)
+if(MSVC)
+  target_compile_options(maya-vision PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
 target_link_libraries(maya-vision PRIVATE mtmd llama)
 target_compile_features(maya-vision PRIVATE cxx_std_17)
 set_target_properties(maya-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

@@ -473,9 +473,47 @@ __device__ __forceinline__ float fma_no_contract(float a, float b, float c) {
 #endif
 }
 
+// The K-quants' minimum term (Q4_K, Q5_K, Q2_K, Q3_K): v = d X - (m0 sl + m1 sh).  CUDA's __fmul_rn / __fadd_rn /
+// __fsub_rn round each operation; HIP's are the plain operators, which ROCm's clang contracts into FMAs - and not the
+// same way in every instantiation: on gfx11 the token kernels (NE 1) and the window kernels (NE 4 ..) of one matrix
+// rounded differently, so a verify window's rows were not the rows the tokens get one at a time and an answer with
+// drafts could leave the answer without (seen with Q5_K experts on a Radeon 8065S).  MF names the rounding, the same
+// in every instantiation of a role:
+//   -1  the expression as written (CUDA: each operation rounded; the strict HIP targets: the same behind barriers)
+//    0  each operation rounded            1  W = fma(m0, sl, m1 sh)            2  W = fma(m1, sh, m0 sl)
+//    3  v = fma(d, X, -W), W as 0         4  ... W as 1                         5  ... W as 2
+// kMinG / kMinU / kMinDN / kMinMV: the gate's, the up's, the down's and the GEMV kernels'.  A HIP build outside the
+// strict targets that asks for it (DS4_IQ_MIN_FORMS: maya-hy4's, whose Maya-L has Q5_K experts) takes the forms its
+// token kernels - the answers without drafts - had from ROCm 7's clang on gfx1151 (hy4_experts_test, HY4_EXPERTS_K:
+// the bits before and after), so those keep their bits and the windows now match them.  DS4_IQ_MF_G / _U / _DN / _MV:
+// a build's own choice.  The other builds of this file compile as before.
+#if defined(STRATA_USE_HIP) && !DS4_IQ_STRICT_FP && defined(DS4_IQ_MIN_FORMS)
+#if !defined(DS4_IQ_MF_G)
+#define DS4_IQ_MF_G 4
+#endif
+#if !defined(DS4_IQ_MF_U)
+#define DS4_IQ_MF_U 5
+#endif
+#if !defined(DS4_IQ_MF_DN)
+#define DS4_IQ_MF_DN 5
+#endif
+#if !defined(DS4_IQ_MF_MV)
+#define DS4_IQ_MF_MV 4
+#endif
+constexpr int kMinG = DS4_IQ_MF_G, kMinU = DS4_IQ_MF_U, kMinDN = DS4_IQ_MF_DN, kMinMV = DS4_IQ_MF_MV;
+#else
+constexpr int kMinG = -1, kMinU = -1, kMinDN = -1, kMinMV = -1;
+#endif
+__device__ __forceinline__ float min_bar(float v) {   // (a value the compiler cannot fold a rounding through)
+#if defined(STRATA_USE_HIP) && defined(__clang__)
+    asm volatile("" : "+v"(v));
+#endif
+    return v;
+}
+
 // the sub-block against 32 int8 activations (xa: values 0..15, xb: 16..31), before their scale: an exact integer dot,
 // its scales in F32 (explicit roundings: every instantiation the same bits)
-template <int T>
+template <int T, int MF = -1>
 __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int4& xb) {
     int lo = __dp4a(s.q[0], xa.x, 0);
     lo = __dp4a(s.q[1], xa.y, lo);
@@ -485,6 +523,24 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
     hi = __dp4a(s.q[5], xb.y, hi);
     hi = __dp4a(s.q[6], xb.z, hi);
     hi = __dp4a(s.q[7], xb.w, hi);
+    if constexpr (Ty<T>::MIN && MF >= 0) {
+        int sl = __dp4a(0x01010101, xa.x, 0);
+        sl = __dp4a(0x01010101, xa.y, sl);
+        sl = __dp4a(0x01010101, xa.z, sl);
+        sl = __dp4a(0x01010101, xa.w, sl);
+        int sh = __dp4a(0x01010101, xb.x, 0);
+        sh = __dp4a(0x01010101, xb.y, sh);
+        sh = __dp4a(0x01010101, xb.z, sh);
+        sh = __dp4a(0x01010101, xb.w, sh);
+        const float d = min_bar(s.d), X = min_bar((float) (s.s0 * lo + s.s1 * hi));
+        const float m0 = min_bar(s.m0), m1 = min_bar(s.m1), fl = min_bar((float) sl), fh = min_bar((float) sh);
+        float W;
+        if constexpr (MF % 3 == 0) W = min_bar(min_bar(m0 * fl) + min_bar(m1 * fh));
+        else if constexpr (MF % 3 == 1) W = min_bar(fmaf(m0, fl, min_bar(m1 * fh)));
+        else W = min_bar(fmaf(m1, fh, min_bar(m0 * fl)));
+        if constexpr (MF < 3) return min_bar(min_bar(d * X) - W);
+        else return min_bar(fmaf(d, X, min_bar(-W)));
+    }
     float v = fmul_no_fma(s.d, (float) (s.s0 * lo + s.s1 * hi));
     if constexpr (Ty<T>::MIN) {
         int sl = __dp4a(0x01010101, xa.x, 0);
@@ -884,8 +940,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                             const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
                             const int4 xa = xp[0], xb = xp[1];
                             const float dx = a.xd[(size_t) xr[i] * nsb + kb];
-                            ag[i] = fma_no_contract(dx, sub_dot<T>(sg, xa, xb), ag[i]);
-                            if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T>(su, xa, xb), au[i]);
+                            ag[i] = fma_no_contract(dx, sub_dot<T, kMinG>(sg, xa, xb), ag[i]);
+                            if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T, kMinU>(su, xa, xb), au[i]);
                         }
                     pg = ng;
                     if constexpr (TWO) pu = nu;
@@ -961,7 +1017,7 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a, int groups
                         if (i < ne) {
                             const int4* hp = (const int4*) (a.hq + (size_t) es[i] * a.n_ff + (size_t) kb * 32);
                             const int4 ha = hp[0], hb = hp[1];
-                            ad[i] = fma_no_contract(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
+                            ad[i] = fma_no_contract(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T, kMinDN>(sd, ha, hb), ad[i]);
                         }
                 }
 #pragma unroll
@@ -1074,9 +1130,11 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
 
 #if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
 // the same on the tensor cores (sm_70+; AMD: RDNA 3 / 4's, rocWMMA): 8 warps each 16 rows x 32 outputs, the tiles
-// F16 in shared memory
+// F16 in shared memory.  RM > 1: a block takes RM x 64 rows (each warp RM x 16), every weight tile decoded once for
+// all of them - an expert's weights decoded once per 64 * RM of its rows, not once per 64 (the decode is most of the
+// tile's work); each output's sums in the same order (the same MMAs over the same K steps): the same bits
 constexpr int kLdT = 40;
-template <int T, bool GATE_UP, int EPI = 0>
+template <int T, bool GATE_UP, int EPI = 0, int RM = 1>
 __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     pdl_wait();
     pdl_trigger();
@@ -1091,8 +1149,9 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     using wh = __half;
 #endif
     constexpr bool TWO = GATE_UP && kBoth<EPI>;   // (gate and up in this pass; EPI 2 / 3: one of them, as wg)
+    constexpr int BR = BM * RM;   // (the block's rows)
     struct Tiles {
-        __half x[BM][kLdT], wg[BN][kLdT], wu[TWO ? BN : 1][kLdT];
+        __half x[BR][kLdT], wg[BN][kLdT], wu[TWO ? BN : 1][kLdT];
     };
     // the results leave through a 16 x 16 tile a warp in the tiles' room (the gate's and the up's accumulators hold the
     // same elements, so the SwiGLU runs on them in registers): a block's shared memory is its tiles' alone - 15 KB, not
@@ -1101,28 +1160,31 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     static_assert(sizeof(Tiles) >= (size_t) (kThreads / 32) * 16 * 16 * sizeof(float), "the warps' output tiles");
     __shared__ __align__(32) unsigned char smem[sizeof(Tiles)];
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
-    __shared__ int src[BM];
+    __shared__ int src[BR];
     Tiles& Tl = *reinterpret_cast<Tiles*>(smem);
     const int e = blockIdx.z;
     const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
-    const int r0 = lo + blockIdx.x * BM;
+    const int r0 = lo + blockIdx.x * BR;
     if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform; skip_le: the light kernels' experts)
     if (a.skip_ge > 0 && hi - lo >= a.skip_ge) return;   // (the caller's FP16 GEMMs')
     load_tab<T>(tab);
-    const int nr = min(BM, hi - r0);
+    const int nr = min(BR, hi - r0);
+    const int nrm = (nr + BM - 1) / BM;   // (the row groups that hold rows: uniform, the others skipped)
     const int c0 = blockIdx.y * BN;
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     const int K = GATE_UP ? a.n_embd : a.n_ff;
     const size_t rb = row_bytes_t<T>(K);
     const int tid = (int) threadIdx.x, warp = tid >> 5;
-    if (tid < BM) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    for (int t = tid; t < BR; t += kThreads) src[t] = t < nr ? (GATE_UP ? a.idx[r0 + t] : r0 + t) : -1;
     __syncthreads();
     const int wm_ = warp >> 1, wn = (warp & 1) * 2;
-    wm::fragment<wm::accumulator, 16, 16, 16, float> fg[2], fu[2];
-    for (int j = 0; j < 2; ++j) {
-        wm::fill_fragment(fg[j], 0.0f);
-        wm::fill_fragment(fu[j], 0.0f);
-    }
+    wm::fragment<wm::accumulator, 16, 16, 16, float> fg[RM][2], fu[RM][2];
+#pragma unroll
+    for (int q = 0; q < RM; ++q)
+        for (int j = 0; j < 2; ++j) {
+            wm::fill_fragment(fg[q][j], 0.0f);
+            wm::fill_fragment(fu[q][j], 0.0f);
+        }
     const int tr = tid >> 2, tq = tid & 3;
     for (int kb = 0; kb < K / 32; ++kb) {
         for (int m = 0; m < (TWO ? 2 : 1); ++m) {
@@ -1132,36 +1194,47 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
 #pragma unroll
             for (int j = 0; j < 8; ++j) dst[j] = __float2half_rn(w8[j]);
         }
-        const int sr = src[tr];
-        if (a.xh_vec) {   // FP16 rows, 16-byte aligned: 8 values in one load (gate / up: the caller's rows_f16 of the same F32
-            // rows - __float2half_rn as below, so the same bits - not 36 conversions of them, a block column each)
-            uint4 v = make_uint4(0u, 0u, 0u, 0u);
-            if (sr >= 0) v = *reinterpret_cast<const uint4*>(a.xh + (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8);
-            *reinterpret_cast<uint4*>(&Tl.x[tr][tq * 8]) = v;
-        } else {
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                __half v = __float2half_rn(0.0f);
-                if (sr >= 0) {
-                    const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
-                    v = GATE_UP ? __float2half_rn(a.xf[at]) : __ushort_as_half(a.xh[at]);
+        for (int q = 0; q < RM; ++q) {
+            if (q >= nrm) break;   // (uniform)
+            const int xr = q * BM + tr;
+            const int sr = src[xr];
+            if (a.xh_vec) {   // FP16 rows, 16-byte aligned: 8 values in one load (gate / up: the caller's rows_f16 of the same
+                // F32 rows - __float2half_rn as below, so the same bits - not 36 conversions of them, a block column each)
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (sr >= 0) v = *reinterpret_cast<const uint4*>(a.xh + (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8);
+                *reinterpret_cast<uint4*>(&Tl.x[xr][tq * 8]) = v;
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    __half v = __float2half_rn(0.0f);
+                    if (sr >= 0) {
+                        const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
+                        v = GATE_UP ? __float2half_rn(a.xf[at]) : __ushort_as_half(a.xh[at]);
+                    }
+                    Tl.x[xr][tq * 8 + j] = v;
                 }
-                Tl.x[tr][tq * 8 + j] = v;
             }
         }
         __syncthreads();
 #pragma unroll
         for (int kk = 0; kk < 32; kk += 16) {
-            wm::fragment<wm::matrix_a, 16, 16, 16, wh, wm::row_major> fa;
-            wm::load_matrix_sync(fa, (const wh*) &Tl.x[wm_ * 16][kk], kLdT);
+            wm::fragment<wm::matrix_a, 16, 16, 16, wh, wm::row_major> fa[RM];
+#pragma unroll
+            for (int q = 0; q < RM; ++q)
+                if (q < nrm) wm::load_matrix_sync(fa[q], (const wh*) &Tl.x[q * BM + wm_ * 16][kk], kLdT);
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 wm::fragment<wm::matrix_b, 16, 16, 16, wh, wm::col_major> fb;
                 wm::load_matrix_sync(fb, (const wh*) &Tl.wg[(wn + j) * 16][kk], kLdT);
-                wm::mma_sync(fg[j], fa, fb, fg[j]);
+#pragma unroll
+                for (int q = 0; q < RM; ++q)
+                    if (q < nrm) wm::mma_sync(fg[q][j], fa[q], fb, fg[q][j]);
                 if (TWO) {
                     wm::load_matrix_sync(fb, (const wh*) &Tl.wu[(wn + j) * 16][kk], kLdT);
-                    wm::mma_sync(fu[j], fa, fb, fu[j]);
+#pragma unroll
+                    for (int q = 0; q < RM; ++q)
+                        if (q < nrm) wm::mma_sync(fu[q][j], fa[q], fb, fu[q][j]);
                 }
             }
         }
@@ -1169,14 +1242,17 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     }
     float* ow = reinterpret_cast<float*>(smem) + (size_t) warp * 16 * 16;   // (the K loop's last barrier: tiles free)
     const int lane = tid & 31;
+#pragma unroll
+    for (int q = 0; q < RM; ++q)
     for (int j = 0; j < 2; ++j) {
+        if (q >= nrm) break;   // (uniform)
         if (TWO)
-            for (int i = 0; i < (int) fg[j].num_elements; ++i)
-                fg[j].x[i] = act_out<EPI>(fg[j].x[i], fu[j].x[i], a.limit);
-        wm::store_matrix_sync(ow, fg[j], 16, wm::mem_row_major);
+            for (int i = 0; i < (int) fg[q][j].num_elements; ++i)
+                fg[q][j].x[i] = act_out<EPI>(fg[q][j].x[i], fu[q][j].x[i], a.limit);
+        wm::store_matrix_sync(ow, fg[q][j], 16, wm::mem_row_major);
         __syncthreads();   // (uniform: every warp stores, then reads its own tile)
         for (int i = lane; i < 16 * 16; i += 32) {
-            const int r = wm_ * 16 + i / 16, c = c0 + (wn + j) * 16 + i % 16;
+            const int r = q * BM + wm_ * 16 + i / 16, c = c0 + (wn + j) * 16 + i % 16;
             if (r >= nr) continue;
             const size_t lr = (size_t) (r0 + r);
             if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = ow[i];
@@ -1217,7 +1293,48 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         for (int c = 0; c < NC; ++c)
             if (c < b.ncol) {
                 const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
-                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T, kMinMV>(s, xp[0], xp[1]), acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+
+// mv_kernel for H jobs alike but for their offsets (a 3D matrix's heads: grid y = the head): head h's job is b0 with w,
+// xq, xd and y moved h strides - one launch for every head where mv's take kMaxJobs a launch.  A row's arithmetic is
+// mv_kernel's, line for line: the same bits.
+template <int T, int NC>
+__global__ void __launch_bounds__(kThreads) mv_heads_kernel(const MvJob b0, size_t w_st, size_t xq_st, size_t xd_st,
+                                                            size_t y_st) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    MvJob b = b0;
+    b.w += (size_t) blockIdx.y * w_st;
+    b.xq += (size_t) blockIdx.y * xq_st;
+    b.xd += (size_t) blockIdx.y * xd_st;
+    b.y += (size_t) blockIdx.y * y_st;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    const int nsb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s;
+        decode<T>(w, kb, tab, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T, kMinMV>(s, xp[0], xp[1]), acc[c]);
             }
     }
 #pragma unroll
@@ -1374,14 +1491,14 @@ __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restr
     }
 }
 
-// as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_DS4_NO_TC=1 keeps the F32 kernel - per device (the GPUs
+// as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), MAYA_DS4_NO_TC=1 keeps the F32 kernel - per device (the GPUs
 // of a run need not be of one generation: one before sm_70 beside newer ones keeps its F32 kernel)
 bool tc_ok() {
 #if defined(STRATA_USE_HIP) && !STRATA_HAS_WMMA
     return false;
 #else
     static const bool off = [] {
-        const char* v = std::getenv("STRATA_DS4_NO_TC");
+        const char* v = std::getenv("MAYA_DS4_NO_TC");
         return v != nullptr && v[0] == '1';
     }();
     static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
@@ -1430,6 +1547,14 @@ bool tc_ok() {
         case kQ8_0: F(kQ8_0); break;       \
         default: DS4_IQ_SWITCH(t, F)       \
     }
+// ... and the experts' roles with the clamped SwiGLU (kActSwiglu), which also take Q6_K and Q8_0: the Q4_K_M quants'
+// recipe gives Q6_K to some layers' down, and maya-hy4 rounds Hy4-flash's BF16 MTP experts to Q8_0 (expert_supported)
+#define DS4_IQ_SWITCH_EXP(t, F)            \
+    switch (t) {                           \
+        case kQ6_K: F(kQ6_K); break;       \
+        case kQ8_0: F(kQ8_0); break;       \
+        default: DS4_IQ_SWITCH(t, F)       \
+    }
 
 // IQ1's token / window kernels: RP rows passes a block (1 or 4), AH the loads a step ahead - measured per platform
 // (ds4_gguf_test --bench-q), the defaults below; DS4_IQ_RP=1|4 and DS4_IQ_AHEAD=0|1 choose (the same sums either way)
@@ -1456,13 +1581,13 @@ const Iq1Var& iq1_var() {
     return v;
 }
 
-// the persistent grids (kPersist): DS4_IQ_PERSIST (MAYA_DS4_IQ_PERSIST, read as STRATA_DS4_IQ_PERSIST): 0 off, 1 on,
+// the persistent grids (kPersist): DS4_IQ_PERSIST (MAYA_DS4_IQ_PERSIST): 0 off, 1 on,
 // unset: on for a device of compute capability 8.0 and up (measured about 2% slower on a V100); set_persist over it (tests)
 std::atomic<int> g_persist_set{-1};
 #if DS4_IQ_PERSIST_BUILD
 int persist_env() {   // -1: not set
     static const int v = [] {
-        const char* e = std::getenv("STRATA_DS4_IQ_PERSIST");
+        const char* e = std::getenv("MAYA_DS4_IQ_PERSIST");
         if (e == nullptr) e = std::getenv("DS4_IQ_PERSIST");
         return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
     }();
@@ -1578,12 +1703,46 @@ void dn_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
     else if (ne <= 8) launch_dn<T, 8>(a, grid, s);
     else launch_dn<T, 16>(a, grid, s);
 }
+static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_RM, else 4 on gfx11, else 1)
+    static const int env = [] {
+        const char* v = std::getenv("DS4_IQ_TC_RM");
+        if (v == nullptr) return 0;
+        const int n = std::atoi(v);
+        return n >= 4 ? 4 : n >= 2 ? 2 : 1;
+    }();
+    if (env > 0) return env;
+#if defined(STRATA_USE_HIP)
+    static std::atomic<int> known[64];   // 0: not asked yet, else the answer
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 1;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (k == 0) {
+        cudaDeviceProp prop{};
+        k = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx11", 5) == 0 ? 4 : 1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k;
+#else
+    return 1;
+#endif
+}
 template <int T, bool GU, int EPI = 0>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
 #if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
     if (tc_ok()) {
         SetArgs b = a;   // (gate / up: FP16 rows when the caller gave them - set_gate_up's x16)
         b.xh_vec = b.xh != nullptr && ((uintptr_t) b.xh & 15) == 0 && (b.ldx & 7) == 0 ? 1 : 0;
+        // a block's rows, 64 x rm, for the sets whose busiest expert has more than 64 rows: 4 on AMD gfx11 (a Radeon
+        // 8065S, Maya-XS's IQ1_S sets: prompts 2K / 8K / 32K +10 / +11 / +10 %, the same tokens), 1 elsewhere (not
+        // measured); DS4_IQ_TC_RM=N (1, 2, 4) sets it
+        const int rm = tc_rows_mult();
+        if (rm > 1 && a.max_rows > BM) {
+            dim3 g2 = grid;
+            g2.x = (unsigned) ((a.max_rows + BM * rm - 1) / (BM * rm));
+            if (rm == 4) pdl_launch(set_tc_kernel<T, GU, EPI, 4>, g2, kThreads, 0, s, b);
+            else pdl_launch(set_tc_kernel<T, GU, EPI, 2>, g2, kThreads, 0, s, b);
+            return;
+        }
         pdl_launch(set_tc_kernel<T, GU, EPI>, grid, kThreads, 0, s, b);
         return;
     }
@@ -1622,9 +1781,9 @@ LightBuf* light_buf(cudaStream_t s, int k) {
     }
     return &b;
 }
-bool light_on() {   // STRATA_DS4_NO_LIGHT=1: every set through the GEMM tiles
+bool light_on() {   // MAYA_DS4_NO_LIGHT=1: every set through the GEMM tiles
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_DS4_NO_LIGHT");
+        const char* v = std::getenv("MAYA_DS4_NO_LIGHT");
         return !(v != nullptr && v[0] == '1');
     }();
     return on;
@@ -1679,7 +1838,7 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
             return true;
         }
 #define LG_(T) launch_light<T, true>(a, *b, s)
-        DS4_IQ_SWITCH(a.tg, LG_)
+        DS4_IQ_SWITCH_EXP(a.tg, LG_)
 #undef LG_
     } else {
         if (a.td == kMXFP4) {
@@ -1687,23 +1846,39 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
             return true;
         }
 #define LD_(T) launch_light<T, false>(a, *b, s)
-        DS4_IQ_SWITCH(a.td, LD_)
+        DS4_IQ_SWITCH_EXP(a.td, LD_)
 #undef LD_
     }
     return true;
 }
 
+// (5 to 8 columns: their own instance - a window of that many tokens need not pay for sixteen; a column's sums are the
+//  same lanes' in the same order whatever the instance.  MAYA_IQ_MV8=0: as before)
+static bool mv8() {
+    static const bool on = !(std::getenv("MAYA_IQ_MV8") && std::getenv("MAYA_IQ_MV8")[0] == '0');
+    return on;
+}
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
+    else if (max_c <= 8 && mv8()) pdl_launch(mv_kernel<T, 8>, grid, kThreads, 0, s, J);
     else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
+}
+template <int T>
+void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s) {
+    const dim3 grid((unsigned) ((b.n + kWarps - 1) / kWarps), (unsigned) H);
+    if (b.ncol <= 1) pdl_launch(mv_heads_kernel<T, 1>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 4) pdl_launch(mv_heads_kernel<T, 4>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else pdl_launch(mv_heads_kernel<T, 16>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
 }
 
 }  // namespace
 
 bool supported(int t) { return t != kQ6_K && t != kQ8_0 && block_bytes(t) > 0; }
+bool down_supported(int t) { return expert_supported(t); }
+bool expert_supported(int t) { return t == kQ6_K || t == kQ8_0 || supported(t); }
 bool mv_supported(int t) { return block_bytes(t) > 0; }
 
 int block_bytes(int t) {
@@ -1767,7 +1942,7 @@ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
         return true;
     }
 #define GU_(T) gu_ne<T>(a, grid, ne_max, s)
-    DS4_IQ_SWITCH(a.tg, GU_)
+    DS4_IQ_SWITCH_EXP(a.tg, GU_)
 #undef GU_
     return true;
 }
@@ -1776,7 +1951,7 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     if (a.n_ff % block_values(a.td) != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
 #define DN_(T) dn_ne<T>(a, grid, ne_max, s)
-    DS4_IQ_SWITCH(a.td, DN_)
+    DS4_IQ_SWITCH_EXP(a.td, DN_)
 #undef DN_
     return true;
 }
@@ -1826,7 +2001,7 @@ namespace {
 constexpr int kMmqCap = 32768;  // maximum compact rows in one prompt set
 bool mmq_on() {
     static const bool enabled = [] {
-        const char* e = std::getenv("STRATA_DS4_EXPERT_MMQ");
+        const char* e = std::getenv("MAYA_DS4_EXPERT_MMQ");
         return e != nullptr && std::strcmp(e, "1") == 0;
     }();
     return enabled;
@@ -1836,7 +2011,7 @@ bool mmq_on() {
 // MAYA_DS4_EXPERT_MMQ_MIN sets it (1: every expert of the set); unset: 32 for IQ1_S, every expert for the other types
 int mmq_min_rows(int type) {
     static const int set = [] {
-        const char* e = std::getenv("STRATA_DS4_EXPERT_MMQ_MIN");
+        const char* e = std::getenv("MAYA_DS4_EXPERT_MMQ_MIN");
         if (e == nullptr) return 0;
         const int n = std::atoi(e);
         return n <= 1 ? 1 : std::max(n, kLightRows + 1);   // (the light kernels take every expert of up to kLightRows)
@@ -2097,7 +2272,7 @@ bool mmq_down(const SetArgs& a, cudaStream_t s) {
 // Prompt expert sets through the fused int8 experts the GLM prompt uses (strata::prefill::rdna4, gfx1151 / gfx1100 /
 // RDNA4): the weights decoded to int8 in the WMMA tiles' shared memory, the activations and the SwiGLU's H rounded to
 // int8 per 32 values (as GLM's), the products on the int8 matrix cores.  On by default where it covers the set's formats
-// (STRATA_DS4_PREFILL_FUSED=0: the FP16 tiles above).  The set's rows are gathered into the scratch of the caller's
+// (MAYA_DS4_PREFILL_FUSED=0: the FP16 tiles above).  The set's rows are gathered into the scratch of the caller's
 // FusedScratchScope (its down output: unused until the down writes it), H goes into the caller's FP16 rows at their
 // stride (2 n_ff bytes: an int8 row is act_bytes(1, n_ff)), and the down reads it there - both passes decide alike.
 namespace {
@@ -2114,11 +2289,11 @@ FusedScratchScope::~FusedScratchScope() {
     fused_scratch_bytes = previous_bytes_;
 }
 namespace {
-// STRATA_DS4_PREFILL_FUSED: unset = on for gfx1151 (Strix / Gorgon Halo, where it is measured), 1 = on wherever the
+// MAYA_DS4_PREFILL_FUSED: unset = on for gfx1151 (Strix / Gorgon Halo, where it is measured), 1 = on wherever the
 // fused experts run (gfx1100, RDNA4: not measured), 0 = off
 bool fused_on() {
     static const int mode = [] {
-        const char* v = std::getenv("STRATA_DS4_PREFILL_FUSED");
+        const char* v = std::getenv("MAYA_DS4_PREFILL_FUSED");
         return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
     }();
     if (mode >= 0) return mode == 1;
@@ -2244,7 +2419,7 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
         return true;
     }
 #define SG_(T) launch_set<T, true>(t, grid, s)
-    DS4_IQ_SWITCH(a.tg, SG_)
+    DS4_IQ_SWITCH_EXP(a.tg, SG_)
 #undef SG_
     return true;
 }
@@ -2273,7 +2448,7 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
     }
     const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (a.n_embd / BN), (unsigned) a.n_exp);
 #define SD_(T) launch_set<T, false>(t, grid, s)
-    DS4_IQ_SWITCH(a.td, SD_)
+    DS4_IQ_SWITCH_EXP(a.td, SD_)
 #undef SD_
     return true;
 }
@@ -2299,6 +2474,14 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             DS4_IQ_SWITCH_MV(t, MV_)
 #undef MV_
         }
+    return true;
+}
+bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
+              cudaStream_t s) {
+    if (H <= 0 || b.n <= 0 || b.k % block_values(b.type) != 0 || b.ncol < 1 || b.ncol > 16) return false;
+#define MVH_(T) mv_heads_nc<T>(b, H, w_stride, xq_stride, xd_stride, y_stride, s)
+    DS4_IQ_SWITCH_MV(b.type, MVH_)
+#undef MVH_
     return true;
 }
 

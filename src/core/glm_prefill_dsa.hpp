@@ -71,7 +71,7 @@ struct Io {
                                            // the FP16 projections; null: cuBLAS / plain hipBLAS (every CUDA build)
 };
 
-/// The glm-dsa mixer sub-batch (mixer_sub returns min(T, this) for a glm-dsa part; STRATA_GLM_PREFILL_SUB wins).
+/// The glm-dsa mixer sub-batch (mixer_sub returns min(T, this) for a glm-dsa part; MAYA_GLM_PREFILL_SUB wins).
 constexpr int kSubBatch = 2048;
 
 /// False on HIP: the glm-dsa prompt kernels are CUDA-only, the prompt runs token by token there.
@@ -101,7 +101,7 @@ bool lane_first(const Glm5Geometry& g, int rows, double upload_ms, double lane_e
 
 /// Per-layer scratch of a chunk of T tokens (the union's glm-dsa share) and what is kept across layers (64-bit).
 size_t scratch_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx);
-size_t keep_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx);
+size_t keep_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx, bool halves = true);
 
 /// The plain residual read half for the chunk: R += block_out (null: none), x = RMS(R) * norm_w, x16.
 bool res_read(const Io& io, const float* block_out, const float* norm_w, std::string& err);

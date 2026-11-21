@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$modelDir = 'D:\Models\Maya-S24'
+$modelDir = 'D:\Models\GLM-5.3-Flash\Maya-S24'
 $cudaRoot = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
 $nvcc = Join-Path $cudaRoot 'bin\nvcc.exe'
 $statusPath = Join-Path $modelDir 'cuda-maya-bootstrap-status.json'

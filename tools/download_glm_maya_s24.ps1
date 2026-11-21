@@ -13,7 +13,7 @@ $env:NO_PROXY = '*'
 # supplies the transport redirect; every completed file is checked against
 # Project Maya's official SHA-256 before it is accepted.
 $repoBase = 'https://hf-mirror.com/peasantsmith/GLM-5.3-Flash-Maya-GGUF/resolve/main'
-$modelDir = Join-Path $DestinationRoot 'Maya-S24'
+$modelDir = Join-Path $DestinationRoot 'GLM-5.3-Flash\Maya-S24'
 $visionDir = Join-Path $modelDir 'vision'
 $statusPath = Join-Path $modelDir 'download-status.json'
 

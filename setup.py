@@ -487,7 +487,8 @@ def find_vcvars(cuda=True, nvcc=None):
     ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first."""
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
-        return None
+        fallback = Path(r"D:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat")
+        return fallback if fallback.is_file() else None
     ranges = [["-version", "[16.0,18.0)"]]
     if not cuda or nvcc_takes_vs2026(nvcc):
         ranges.append(["-version", "[18.0,)"])

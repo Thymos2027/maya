@@ -1,0 +1,46 @@
+{
+  "experiment": "glm-commit-ab",
+  "date": "2026-11-21",
+  "timezone": "Asia/Shanghai",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "vram_mib": 16311,
+    "physical_ram_bytes": 137140031488
+  },
+  "model": "GLM-5.3-Flash Maya-S24",
+  "identity": {
+    "head": "68a2264fa680b561bf4064ba69f7f23079ef0c59",
+    "exe_sha256": "10e17bb12c54ea5903d9541dd5f9eb03414df37883196d15556d6d3847b39007",
+    "config_sha256": "c8d749eefb9dc7a9c8ab27cdf7392702cce4b7cfff69cc97fd318e0c25d1ee55",
+    "prompts_sha256": "5fb5dfbdc3c49daea378dad6a1c82eec1b2523ab2eafd142087e214d7be2272d"
+  },
+  "method": "Two fresh engine starts; warm-up excluded; four mixed prompts, up to 256 tokens each; MTP off; temperature 0.",
+  "order": [
+    "A1",
+    "A2",
+    "reboot",
+    "B1",
+    "B2"
+  ],
+  "observed_decode_gain_fraction": 0.06155576571614274,
+  "A_tok_s": 14.154028857389626,
+  "B_tok_s": 15.025290941674626,
+  "conclusions": [
+    "Increasing the allocated page file from 4096 to 32768 MiB increased the commit limit by 28 GiB and removed the commit-budget warning.",
+    "Measured decode throughput increased by approximately 6.16% in this short test.",
+    "Pinned RAM expert-cache size remained approximately 78 GiB; both phases already reported 0.00 decode disk reads/token at engine-log precision.",
+    "The observation does not establish that the page-file change alone caused the throughput gain."
+  ],
+  "limitations": [
+    "Two repetitions per phase; A,A then B,B across a reboot; no interleaved or reverse-order test.",
+    "Automatic PCIe share and VRAM expert-cache size varied between starts; record them as confounders.",
+    "Generated token counts differed despite greedy sampling; this is a throughput comparison, not an output-equivalence validation.",
+    "Four short prompts with up to 256 generated tokens each; no long-context or concurrency test.",
+    "Disk measurements are engine-reported rounded counters, not physical storage-device I/O counters."
+  ],
+  "raw_artifacts": "logs/experiments/glm-commit/20261121-commit32g",
+  "source_result_sha256": {
+    "A": "4de0c3053982e7024c80d4af52a93a5abbf826aa6d0de964bbc6b733eaea8355",
+    "B": "cb6419fb47e92352a34e44e47fb4d87abba47ee5001cadd1c92fa434cfb2b17c"
+  }
+}

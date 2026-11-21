@@ -1,0 +1,22 @@
+{
+  "question": "Does increasing the Windows page file improve GLM-5.3-Flash Maya-S24 decode performance on the RTX 5060 Ti host?",
+  "phase_a": "Original page file: initial 4096 MiB, maximum 8192 MiB; capture actual allocation and commit limit at run time.",
+  "phase_b": "C: page file initial and maximum 32768 MiB; reboot and verify an actual commit-limit increase of at least 17 GiB.",
+  "controls": {
+    "model": "GLM-5.3-Flash Maya-S24",
+    "mtp": false,
+    "context": 32768,
+    "parallel": 1,
+    "temperature": 0,
+    "top_p": 1,
+    "fresh_engine_starts_per_phase": 2,
+    "warmup_max_tokens": 64,
+    "prompts": "bench/prompts/glm-commit.json",
+    "answer_max_tokens": 256
+  },
+  "measurements": ["per-request engine metrics", "decode tokens per second", "engine load seconds", "RAM and VRAM expert slots", "commit limit and committed bytes", "actual page file allocation"],
+  "raw_artifacts": "logs/experiments/glm-commit/<run-id>/<A-or-B>/",
+  "reviewed_results": "bench/results/<date>-rtx5060ti-glm-commit/",
+  "limitations": ["A,A then B,B, across a system-setting change and reboot; not interleaved.", "Short mixed prompts; follow-up long-context testing may differ.", "Engine timing and cache placement adapt at each start; retain actual settings and per-run values."],
+  "recovery": "Restore the original page file sizes from phase A's system-before.json using tools/set_glm_experiment_pagefile.ps1 -Action Restore; restart Windows. The benchmark restores an initially loaded idle GLM server after each phase."
+}

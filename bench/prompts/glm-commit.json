@@ -1,0 +1,6 @@
+[
+  {"text": "Write a Python script that reads a CSV file of sales (date, region, amount) and prints the total for each region and month as a table, with comments.", "thinking": false},
+  {"text": "Explain how a hash table works, then show a short Python class that implements one.", "thinking": false},
+  {"text": "Write a friendly email to my team: the release is on track for Friday, two bugs are left, and every test passes. Ask who can review the last changes.", "thinking": false},
+  {"text": "Write a JavaScript function that removes duplicate objects from an array by their id, keeping the newest one, and explain the choice of data structure.", "thinking": true}
+]

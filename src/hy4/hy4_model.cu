@@ -262,7 +262,19 @@ struct Layer {
     CpuExperts cex;              // the CPU lane's view of the layer's experts (the file's tensors)
     int ffe = 0;                 // an expert's width here (a tensor-parallel member's slice: its share of n_ff_exp)
     int tpm = -1;                // the tensor-parallel member whose slice this is (-1: the whole layer)
-    bool partial() const { return tpm < 0 && !dense && !mtp && n_res < (int) slot_of.size(); }
+    std::vector<char> lane_e;    // (tensor parallel, member 0's: the experts no member holds, the CPU lane's; else empty)
+    std::vector<char> stream_e;  // (... any member's: the ones of them it sends to its own GPU for a prompt chunk)
+    bool partial() const {
+        return !dense && !mtp && (tpm < 0 ? n_res < (int) slot_of.size() : !lane_e.empty());
+    }
+    // expert e is the CPU lane's here (a member's slot -1 alone is another member's expert)
+    bool on_lane(int e) const { return tpm < 0 ? slot_of[(size_t) e] < 0 : !lane_e.empty() && lane_e[(size_t) e] != 0; }
+    int n_lane() const {
+        if (tpm < 0) return (int) slot_of.size() - n_res;
+        int n = 0;
+        for (char c : lane_e) n += c != 0;
+        return n;
+    }
     // the MTP block (il == n_layer): its input norms and projection, and its output's norm (no hyper-connections)
     bool mtp = false;
     // a DFly2 draft layer: no indexer and no cache of its own - kv is its trunk layer's, the keys the drafter's lists
@@ -349,7 +361,13 @@ struct Gpu {
     float* cpo = nullptr;   // (the CPU lane's sums, [Tc][n_lat])
     uint8_t* stage = nullptr;   // (a prompt's streamed experts: kStage slots of the largest blob)
     double h2d_gbs = 10.0;      // (... the copies to it, GB/s: measured at the load)
+    int heads_one = -1;         // (a token window's head-by-head GEMVs in one launch: 1, 8 heads a launch: 0, -1 not
+                                //  timed yet - mm_heads)
     int* pmap = nullptr;        // (... each expert's slot in them, -1: not this pass's)
+    // (tensor parallel with the CPU lane: the member's own pinned routing, bounce and map; its thread streams its share)
+    int* hs_ids = nullptr;
+    uint8_t* hs_stage = nullptr;
+    int* hs_pmap = nullptr;
     // ... and its attention as GEMMs: the scores, the probabilities (F16), a ring's keys in order, the picks' mask
     float *sS = nullptr, *dmask = nullptr;
     uint16_t *sP = nullptr, *kbuf = nullptr;
@@ -399,6 +417,7 @@ struct Model::Impl {
     bool mtp_async = false;
     bool mtp_own = false;                // (the plan's: that scratch is counted on the head's GPU - tensor_split)
     std::vector<double> free0;           // each GPU's free VRAM as the plan first read it (a plan run again: the same)
+    std::string room_out;                // (--room-report's measurement: Model::room_report)
     std::atomic<bool> emb_pending{false};   // (a queued pass's copy of h_emb maybe still in flight)
     cudaEvent_t ev_hin = nullptr, ev_mtp = nullptr, ev_emb = nullptr;
     std::unique_ptr<Crew> mtp_crew;
@@ -567,6 +586,97 @@ struct Model::Impl {
     };
     std::vector<Helper> hel;
     int U = 0;
+    // A layer's routed experts unsplit (tp_unsplit[layer]), expert e unit tp_own[layer n_expert + e]'s alone: where the
+    // slices would leave a tenth or more of zero blocks (experts of 6 blocks over 4 units: 2 blocks a slice held for
+    // 1.5 used, a third more VRAM and work; over 5 units: two thirds).  HY4_TP_EXPERTS=slices|unsplit: one way.
+    std::vector<char> tp_unsplit;
+    std::vector<int> tp_own;
+    // ... and where the members do not hold every expert: tp_cap[member] of each layer's experts each (the plan's, by
+    // its VRAM), the most routed first; the others no member's (tp_own below 0): member 0's CPU lane computes them for
+    // a token, and a prompt chunk's go over PCIe as on the layer split, a share of them to each member's GPU
+    std::vector<int> tp_cap;
+    const std::vector<Layer>& lane_layers() const { return tp > 1 ? TL[0] : L; }
+    std::vector<Layer>& lane_layers() { return tp > 1 ? TL[0] : L; }
+    // (a member's staging slots as its last pass left them: the layer whose experts they hold and how many, -1 where
+    //  the layer took several passes; a chunk's second half finds the first half's experts there)
+    int stg_il[16], stg_np[16];
+    int tp_own_most() const { return (g.n_expert + U - 1) / U; }   // (the experts a unit holds at most)
+    bool unsplit_experts(int il) const { return (size_t) il < tp_unsplit.size() && tp_unsplit[(size_t) il] != 0; }
+    // the blocks a unit's slice of layer il's experts holds, and the blocks an expert is (0: not a routed layer)
+    int slice_blocks(int il, int& B) const {
+        const Tensor* td = pk.get("blk." + std::to_string(il) + ".ffn_down_exps.weight");
+        const int bv = td ? iq::block_values(type_id(td->type)) : 0;
+        B = bv > 0 ? g.n_ff_exp / bv : 0;
+        return B > 0 && U > 0 ? (U >= B ? 1 : (B + U - 1) / U) : 0;
+    }
+    void pick_unsplit_experts() {
+        const char* e = std::getenv("HY4_TP_EXPERTS");
+        tp_unsplit.assign((size_t) g.n_layer, 0);
+        for (int il = g.n_dense_lead; il < g.n_layer; ++il) {
+            int B = 0;
+            const int c = slice_blocks(il, B);
+            if (c == 0) continue;
+            const bool pad = U < B && c * U * 10 >= B * 11;
+            tp_unsplit[(size_t) il] = e && !std::strcmp(e, "unsplit") ? 1 : e && !std::strcmp(e, "slices") ? 0 : pad;
+        }
+    }
+    // a unit's share of layer il's routed experts' bytes, w units side by side
+    double expert_share(int il, int w) const {
+        if (unsplit_experts(il)) return (double) std::min(g.n_expert, w * tp_own_most()) / g.n_expert;
+        int B = 0;
+        const int c = slice_blocks(il, B);
+        return c == 0 || U >= B ? (double) w / std::max(1, U) : std::min(1.0, (double) w * c / B);
+    }
+    // the unsplit experts' units: each layer's experts dealt round the units from the most routed down (the profile's
+    // counts; none: by index), so every unit holds as many and as much of the routing as the next
+    void deal_unsplit_experts() {
+        tp_own.assign((size_t) g.n_layer * g.n_expert, 0);
+        std::vector<int> order((size_t) g.n_expert);
+        int n = 0, first = -1;
+        for (int il = 0; il < g.n_layer; ++il) {
+            if (!unsplit_experts(il)) continue;
+            for (int e = 0; e < g.n_expert; ++e) order[(size_t) e] = e;
+            if (hot.loaded && (size_t) (il + 1) * g.n_expert <= hot.score.size()) {   // (HY4_HOT's file)
+                const float* c = hot.score.data() + (size_t) il * g.n_expert;
+                std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return c[x] > c[y]; });
+            } else if ((size_t) (il + 1) * g.n_expert <= prof_in.size()) {
+                const uint32_t* c = prof_in.data() + (size_t) il * g.n_expert;
+                std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return c[x] > c[y]; });
+            }
+            if (tp_cap.empty()) {
+                for (int r = 0; r < g.n_expert; ++r) tp_own[(size_t) il * g.n_expert + (size_t) order[(size_t) r]] = r % U;
+            } else {   // (round the members that still have room; none: no member's)
+                std::vector<int> left = tp_cap;
+                int m = 0, open = 0, none = 0;
+                for (int c : left) open += c > 0;
+                for (int r = 0; r < g.n_expert; ++r) {
+                    int u = -1;
+                    for (int t = 0; t < tp && open > 0 && u < 0; ++t, m = (m + 1) % tp)
+                        if (left[(size_t) m] > 0) u = m;
+                    if (u >= 0) {
+                        if (--left[(size_t) u] == 0) --open;
+                        m = (u + 1) % tp;
+                    }
+                    // (no member's: -1 - the member that sends it to its GPU for a prompt chunk, in turn)
+                    tp_own[(size_t) il * g.n_expert + (size_t) order[(size_t) r]] = u >= 0 ? u : -1 - (none++ % tp);
+                }
+            }
+            if (first < 0) first = il;
+            ++n;
+        }
+        if (n == 0) return;
+        int B = 0;
+        const int c = slice_blocks(first, B);
+        char buf[320], why[160] = "";
+        if (!tp_cap.empty())
+            std::snprintf(why, sizeof why, " (as many of a layer's on each as its VRAM takes, the most routed first)");
+        else if (U < B && c * U > B)
+            std::snprintf(why, sizeof why, " (slices would hold %d of an expert's %d blocks each: %.0f%% "
+                          "more VRAM and work)", c, B, 100.0 * c * U / B - 100.0);
+        std::snprintf(buf, sizeof buf, "INFO tensor parallel: %d layers' routed experts unsplit, each on one of the %d "
+                      "GPUs%s", n, U, why);
+        info.push_back(buf);
+    }
     float* tp_route = nullptr;
     unsigned* tp_froute = nullptr;
     float* tp_route2 = nullptr;      // (a staggered chunk's second half's routing, and its counter)
@@ -685,6 +795,9 @@ struct Model::Impl {
         if (h_pmap) cudaFreeHost(h_pmap);
         for (uint16_t* p : kv_host)
             if (p) cudaFreeHost(p);
+        for (Gpu& gp : G)
+            for (void* p : {(void*) gp.hs_ids, (void*) gp.hs_stage, (void*) gp.hs_pmap})
+                if (p) cudaFreeHost(p);
         crew.reset();
         summer.reset();
         for (void* p : {(void*) tp_part, (void*) tp_sum, (void*) tp_xo, (void*) tp_fout, (void*) tp_fin, (void*) tp_fx,
@@ -1009,6 +1122,11 @@ struct Model::Impl {
     static constexpr int kChunkBase = 1024;
     static constexpr int kChunks[2] = {4096, 2048};
     static constexpr int kStage = 128;   // (a prompt's streamed experts a pass)
+    // tensor parallel with the CPU lane: a prompt chunk of this many rows or more has every member send its share of
+    // the experts no member holds to its own GPU (kShareThreads copy a member's pass into its bounce); a shorter one
+    // is member 0's alone, the CPU lane or its GPU as on the layer split
+    static constexpr int kTpStream = 256;
+    static constexpr int kShareThreads = 8;
     // The indexed layers' keys a dense (tensor-core) prompt sub-batch spans at most: beyond, the gathering kernel.
     // Both read the indexer's same picks (the dense one masks every other key out), so the limit moves no pick - only
     // which kernel sums a token's attention.  The dense path's time grows with the span, the gathering kernel's does
@@ -1362,6 +1480,8 @@ struct Model::Impl {
                     head_tp = false;
                     mem.clear();
                     hel.clear();
+                    tp_unsplit.clear();
+                    tp_cap.clear();
                     TL.clear();
                     for (Gpu& gp : G) {
                         gp.sH = 64;
@@ -1390,19 +1510,78 @@ struct Model::Impl {
                     }
                     return false;
                 };
+                // (--tp auto: where the group of N does not hold the model, one GPU fewer - the one left out holds the
+                //  head, the drafts and a helper's share of the experts - before the layer split.  HY4_TP_DOWN=0: N only)
+                const char* dn = std::getenv("HY4_TP_DOWN");
+                const int n_min = o.tp < 0 && !(dn && std::atoi(dn) == 0) ? 2 : N, n_all = N;
                 std::string terr;
-                if (split(terr)) return true;
-                // (--kv auto: every member holds the whole cache - in 8-bit rows, 58% of its VRAM, when F16 does not fit)
-                if (o.kv < 0 && !kv_q8 && kv_q8_rows()) {
-                    kv_q8 = true;
-                    std::string t8;
-                    if (split(t8)) {
-                        info.push_back("INFO the latent cache in 8-bit rows (--kv auto): with F16 rows tensor parallel "
-                                       "does not hold this context (" + terr + ")");
+                for (int n = N; n >= n_min; --n) {
+                    std::string tn;
+                    N = n;
+                    if (split(tn)) {
+                        if (!terr.empty())
+                            info.push_back("INFO tensor parallel over " + std::to_string(n) + " GPUs (--tp auto): " + terr);
                         return true;
                     }
-                    kv_q8 = false;
-                    terr += "; in 8-bit rows: " + t8;
+                    // (--kv auto: every member holds the whole cache - in 8-bit rows, 58% of its VRAM, when F16 does not fit)
+                    if (o.kv < 0 && !kv_q8 && kv_q8_rows()) {
+                        kv_q8 = true;
+                        std::string t8;
+                        if (split(t8)) {
+                            info.push_back("INFO the latent cache in 8-bit rows (--kv auto): with F16 rows tensor parallel "
+                                           "does not hold this context (" + tn + ")");
+                            if (!terr.empty())
+                                info.push_back("INFO tensor parallel over " + std::to_string(n) + " GPUs (--tp auto): " + terr);
+                            return true;
+                        }
+                        kv_q8 = false;
+                        tn += "; in 8-bit rows: " + t8;
+                    }
+                    terr += (terr.empty() ? "" : "; ") + tn;
+                }
+                N = n_all;   // (none held it: what follows weighs the whole group again)
+                // The group does not hold every routed expert: each member takes as many of every layer's as its VRAM
+                // holds (unsplit, the most routed first) and the others are the CPU lane's, as on the layer split: the
+                // cache in 8-bit rows where --kv auto allows (more experts in VRAM), the MTP block's pass in line
+                // (--tp auto takes it for a group of 3 GPUs or more; a group of 2 keeps the layer split, whose prompts
+                //  read faster there, unless HY4_TP_LANE=1. HY4_TP_LANE=0: the layer split for every group. The INFO
+                //  line says what the group would hold)
+                {
+                    const char* le = std::getenv("HY4_TP_LANE");
+                    const bool lane_set = le && *le;
+                    const bool lane_on = lane_set ? std::atoi(le) != 0 : N >= 3;
+                    const bool asked = o.tp > 0 || lane_on;
+                    const bool was = kv_q8;
+                    if (o.kv < 0 && kv_q8_rows()) kv_q8 = true;
+                    undo();
+                    fb = free_b;
+                    std::string tl;
+                    const bool fit_l = tensor_split(ndev, devs, fb, tl, N, false, true);
+                    long long held = 0;
+                    for (int c : tp_cap) held += c;
+                    const double pct = 100.0 * (double) std::min<long long>(held, g.n_expert) / g.n_expert;
+                    if (fit_l && !asked) {
+                        char lb[240];
+                        if (lane_set)
+                            std::snprintf(lb, sizeof lb, "HY4_TP_LANE=0 - the group would hold %.0f%% of the routed "
+                                          "experts (HY4_TP_LANE=1 or --tp %d takes it)", pct, N);
+                        else
+                            std::snprintf(lb, sizeof lb, "a group of %d GPUs takes the CPU lane only with HY4_TP_LANE=1 "
+                                          "or --tp %d - the group would hold %.0f%% of the routed experts", N, N, pct);
+                        tl = lb;
+                        undo();
+                    } else if (fit_l) {
+                        char lb[400];
+                        std::snprintf(lb, sizeof lb, "INFO tensor parallel with the CPU lane: the group holds %.0f%% of the "
+                                      "routed experts beside its own parts and caches (%s); the others are computed on the "
+                                      "CPU for a token and sent to the GPUs for a prompt chunk, a share to each",
+                                      pct, terr.c_str());
+                        info.push_back(lb);
+                        if (kv_q8 && !was) info.push_back("INFO the latent cache in 8-bit rows (--kv auto)");
+                        return true;
+                    }
+                    kv_q8 = was;
+                    terr += "; with the CPU lane: " + tl;
                 }
                 if (o.tp > 0) {
                     err = terr;
@@ -1595,9 +1774,12 @@ struct Model::Impl {
     // Tensor parallel's plan: the last `tp` GPUs the members (of one kind: their copies of the residual must stay the
     // same bit for bit), the first other GPU the head's (the output head, the MTP block) - member 0's when there is none;
     // each member's VRAM checked against its share of every layer
+    // (lane: where the members do not hold every routed expert, each holds as many of every layer's as its VRAM takes,
+    //  unsplit, and the others are the CPU lane's (tp_cap); else that is the error)
     bool tensor_split(int ndev_all, const std::vector<int>& devs, std::vector<double>& free_b, std::string& err, int n_tp,
-                      bool own = false) {
+                      bool own = false, bool lane = false) {
         (void) ndev_all;
+        tp_cap.clear();
         const int N = std::min<int>(n_tp, (int) devs.size());
         if (N < 2) {
             err = "--tp " + std::to_string(n_tp) + ": tensor parallel takes 2 GPUs or more (" +
@@ -1699,8 +1881,9 @@ struct Model::Impl {
             h.unit0 = u0;
             u0 += h.w;
         }
+        pick_unsplit_experts();
         // a member's bytes of layer il: its share of the split matrices and of the experts, the rest whole
-        auto member_bytes = [&](int il) {
+        auto member_bytes = [&](int il, bool experts) {
             static const char* split[] = {"attn_q_b.weight", "attn_k_b.weight", "attn_v_b.weight",
                                           "attn_output.weight", "attn_gate.weight", "attn_sinks.weight",
                                           "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
@@ -1714,8 +1897,8 @@ struct Model::Impl {
                 bool sp = false;
                 for (const char* x : split) sp |= rest == x;
                 const bool half = rest == "ffn_gate_inp.weight" && narrowable(n);   // (kept as BF16: mat_narrow)
-                b += ex ? (double) t.bytes / U * 1.02 + 4096 : sp ? (double) t.bytes / N * 1.02 + 4096
-                        : (double) t.bytes * (half ? 0.5 : 1.0) + 256;
+                b += ex ? (experts ? (double) t.bytes * expert_share(il, 1) * 1.02 + 4096 : 0.0)
+                        : sp ? (double) t.bytes / N * 1.02 + 4096 : (double) t.bytes * (half ? 0.5 : 1.0) + 256;
             }
             if (g.swa[(size_t) il]) b += (double) ring * kv_rb();
             else
@@ -1724,7 +1907,7 @@ struct Model::Impl {
             return b;
         };
         double need = 0;
-        for (int il = 0; il < g.n_layer; ++il) need += member_bytes(il);
+        for (int il = 0; il < g.n_layer; ++il) need += member_bytes(il, true);
         const Tensor* ot = pk.get("output.weight");
         double head_b = (ot ? (double) ot->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                         (double) ring * g.n_embd * 4;
@@ -1754,9 +1937,50 @@ struct Model::Impl {
                 }
             }
         }
+        bool fits = true;
+        for (int i : mem) fits = fits && need <= free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0);
+        const char* ee = std::getenv("HY4_TP_EXPERTS");
+        if (!fits && lane && hel.empty() && !(ee && !std::strcmp(ee, "slices"))) {
+            // every member's own parts, one expert of every layer, the prompts' staging slots
+            double fixed = 0, one = 0, stage = 0;
+            for (int il = 0; il < g.n_layer; ++il) {
+                fixed += member_bytes(il, false);
+                if (il < g.n_dense_lead) continue;
+                one += (double) expert_bytes(il) * 1.02;
+                stage = std::max(stage, (double) expert_bytes(il) * kStage);
+                tp_unsplit[(size_t) il] = 1;
+            }
+            std::vector<int> cap((size_t) N, 0);
+            long long total = 0;
+            for (int j = 0; j < N; ++j) {
+                const int i = mem[(size_t) j];
+                const double room = free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0) - fixed - stage;
+                if (room < 0) {
+                    char buf[320];
+                    std::snprintf(buf, sizeof buf, "--tp %d: a member's own parts and caches need %.2f GB of VRAM, GPU %d "
+                                  "has %.2f GB free beyond the reserve (a smaller --max-context, or the layer split: "
+                                  "--tp 0)", N, (fixed + stage) / 1e9, devs[(size_t) i], (room + fixed + stage) / 1e9);
+                    err = buf;
+                    return false;
+                }
+                cap[(size_t) j] = std::min(g.n_expert, (int) std::floor(room / std::max(1.0, one)));
+                total += cap[(size_t) j];
+            }
+            // (--tp auto: where the members hold less than half of the experts the layer split is taken as before)
+            if (total * 2 < g.n_expert && o.tp < 0) {
+                char buf[320];
+                std::snprintf(buf, sizeof buf, "--tp %d: the members would hold %.0f%% of the routed experts beside their "
+                              "own parts and caches", N, 100.0 * (double) total / g.n_expert);
+                err = buf;
+                return false;
+            }
+            tp_cap = cap;
+            fits = true;
+            need = fixed + one * *std::max_element(cap.begin(), cap.end());
+        }
         for (int i : mem) {
             const double have = free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0);
-            if (need > have) {
+            if (!fits && need > have) {
                 char buf[320];
                 std::snprintf(buf, sizeof buf, "--tp %d: a member needs %.2f GB of VRAM, GPU %d has %.2f GB free beyond "
                               "the reserve (a smaller --max-context, or the layer split: --tp 0)", N, need / 1e9,
@@ -1765,7 +1989,7 @@ struct Model::Impl {
                 return false;
             }
         }
-        {
+        if (tp_cap.empty()) {
             double have = 1e30;
             for (int i : mem) have = std::min(have, free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0));
             char buf[200];
@@ -1795,6 +2019,8 @@ struct Model::Impl {
 
     // the members' layers (a thread a member), their scratch, the head GPU's scratch, the pinned buffers and threads
     bool load_tp(std::string& err) {
+        deal_unsplit_experts();
+        std::fill(std::begin(stg_il), std::end(stg_il), -1);
         std::vector<std::string> errs((size_t) tp);
         std::vector<std::thread> th;
         head_m.assign(head_tp ? (size_t) tp : 0, HeadPart());
@@ -2355,6 +2581,7 @@ struct Model::Impl {
     // side by side, zero blocks after them up to ceil(B / N) (a zero row adds nothing), an expert of none of its blocks
     // left out (slot -1).  The SwiGLU is a value's own, so the slices' sums are the expert's.
     // (units [m, m + w): a helper's several units in one slice - its blocks of each expert side by side)
+    // (unsplit experts, unsplit_experts(): every block of expert e is unit tp_own's, the others' slot -1 for it)
     bool expert_slices(Layer& l, Gpu& gp, std::string& err, int m, int N, const uint8_t* sg, const uint8_t* su,
                        const uint8_t* sd, int w = 1) {
         const int lat = g.n_lat, ff = g.n_ff_exp, bv = iq::block_values(l.td), B = ff / bv;
@@ -2362,10 +2589,11 @@ struct Model::Impl {
         const size_t bd = iq::row_bytes(l.td, bv), rd = iq::row_bytes(l.td, ff), db = rd * (size_t) lat;
         auto al = [](size_t b) { return (b + 255) / 256 * 256; };
         std::vector<std::vector<int>> mine((size_t) g.n_expert);
+        const int* own = unsplit_experts(l.il) ? tp_own.data() + (size_t) l.il * g.n_expert : nullptr;
         int cmax = 0;
         for (int e = 0; e < g.n_expert; ++e) {
             for (int j = 0; j < B; ++j) {
-                const int u = (int) (((int64_t) e * B + j) % N);
+                const int u = own ? own[e] : (int) (((int64_t) e * B + j) % N);
                 if (u >= m && u < m + w) mine[(size_t) e].push_back(j);
             }
             cmax = std::max(cmax, (int) mine[(size_t) e].size());
@@ -2410,6 +2638,26 @@ struct Model::Impl {
             }
             batch.push_back(e);
             if (batch.size() == 64 && !flush()) return false;
+        }
+        if (own && m < tp && w == 1) {   // (the experts no member holds: member 0's CPU lane's, each member's share)
+            bool any = false;
+            for (int e = 0; e < g.n_expert; ++e) any |= own[e] < 0;
+            if (any) {
+                l.stream_e.assign((size_t) g.n_expert, 0);
+                for (int e = 0; e < g.n_expert; ++e) l.stream_e[(size_t) e] = own[e] == -1 - m;
+                if (m == 0) {
+                    l.lane_e.assign((size_t) g.n_expert, 0);
+                    for (int e = 0; e < g.n_expert; ++e) l.lane_e[(size_t) e] = own[e] < 0;
+                }
+                if (!l.cex.init(l.tg, l.td, lat, ff, err)) {
+                    err = "blk." + std::to_string(l.il) + ": the CPU lane does not take these experts: " + err;
+                    return false;
+                }
+                l.cex.gate = sg;
+                l.cex.up = su;
+                l.cex.down = sd;
+                l.cex.limit = g.limit[(size_t) l.il];
+            }
         }
         return flush();
     }
@@ -2489,6 +2737,7 @@ struct Model::Impl {
         }
         if (!gp.alloc(gp.arena, at + pad_b, err)) return false;
         gp.arena_b = at + pad_b;
+        k::hc_reserve(Tc);   // (the hyper-connections' buffers for a chunk's rows: never grown inside a forward)
         at = 0;
         carve = true;
         all();
@@ -2657,7 +2906,16 @@ struct Model::Impl {
                 t.pixels = o.vision ? vgeo.max_pixels : 0;
                 t.own = mtp_own;
                 t.head = head_tp;
-                for (const Layer& l : L) t.res += l.n_res;   // (the layer split's; tensor parallel holds them all)
+                t.lane = !tp_cap.empty();
+                for (const Layer& l : L) t.res += l.n_res;   // (the layer split's)
+                if (tp > 1) {   // (tensor parallel: all of them, or what the members' room comes to)
+                    long long held = g.n_expert;
+                    if (!tp_cap.empty()) {
+                        held = 0;
+                        for (int c : tp_cap) held += c;
+                    }
+                    t.res = std::min<long long>(held, g.n_expert) * (g.n_layer - g.n_dense_lead);
+                }
                 return t;
             };
             int c = 0;
@@ -2740,29 +2998,92 @@ struct Model::Impl {
             int n_gpu = 0;
             CK(cudaGetDeviceCount(&n_gpu));
             if (!o.gpus.empty()) n_gpu = (int) o.gpus.size();
-            df_room = pk.num("dfly_layers") >= 1 && (o.dfly2 || n_gpu == 1);
-            std::string e1, df_why;
-            bool ok1 = choose(e1);
-            if (df_room) {
-                const Sum s1 = sum(ok1);
-                df_room = false;
-                std::string e0;
-                const bool ok0 = choose(e0);
-                const Sum s0 = sum(ok0);
-                if (s0 == s1) {   // (the plan with its room, chosen again)
-                    df_room = true;
-                    ok1 = choose(e1);
-                } else {
-                    ok1 = ok0;
-                    e1 = e0;
-                    df_why = !s1.ok ? "the start does not fit beside it"
-                             : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
-                             : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
-                             : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
-                             : s1.chunk != s0.chunk || s1.span != s0.span ? "beside it prompts would be read in shorter pieces"
-                                                                         : "beside it the GPUs would be shared otherwise";
+            // (the whole choice, the drafter's room with it: the plan's state is then the start's; false: its error in e1)
+            auto decide = [&](std::string& e1, std::string& df_why) -> bool {
+                e1.clear();
+                df_why.clear();
+                df_room = pk.num("dfly_layers") >= 1 && (o.dfly2 || n_gpu == 1);
+                bool ok1 = choose(e1);
+                if (df_room) {
+                    const Sum s1 = sum(ok1);
+                    df_room = false;
+                    std::string e0;
+                    const bool ok0 = choose(e0);
+                    const Sum s0 = sum(ok0);
+                    if (s0 == s1) {   // (the plan with its room, chosen again)
+                        df_room = true;
+                        ok1 = choose(e1);
+                    } else {
+                        ok1 = ok0;
+                        e1 = e0;
+                        df_why = !s1.ok ? "the start does not fit beside it"
+                                 : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
+                                 : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
+                                 : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
+                                 : s1.chunk != s0.chunk || s1.span != s0.span ? "beside it prompts would be read in shorter pieces"
+                                                                             : "beside it the GPUs would be shared otherwise";
+                    }
+                }
+                return ok1;
+            };
+            // --room-report (the server asks at a first start on a PC whose cards it has no such figure for): each GPU's
+            // free VRAM as read above, and how much less of it this start's choices hold with - the latent cache's
+            // rows, KV streaming, the drafter's room, the pictures, the GPUs' layout, that it starts at all (not the
+            // prompt chunk or span an auto start takes, nor how many routed experts sit in VRAM: those follow the room
+            // left).  The same plan against smaller readings, one GPU at a time - nothing allocated, and each try is
+            // undone by the next (again()): the start itself is chosen after it, as without it
+            room_out.clear();
+            std::string room_line;
+            if (o.room_report) {
+                struct Pick {
+                    bool ok, q8, vision, head, own, df;
+                    int tp;
+                    long long pixels, kvres;
+                    bool operator==(const Pick& b) const {
+                        return ok == b.ok && q8 == b.q8 && vision == b.vision && head == b.head && own == b.own &&
+                               df == b.df && tp == b.tp && pixels == b.pixels && kvres == b.kvres;
+                    }
+                };
+                auto pick = [&]() {
+                    std::string e, w;
+                    const bool ok = decide(e, w);
+                    return Pick{ok, kv_q8, o.vision, head_tp, mtp_own, df_room, tp,
+                                o.vision ? (long long) vgeo.max_pixels : 0, (long long) o.kv_resident};
+                };
+                const Pick ref = pick();
+                const bool streamed = kv_res() > 0;   // (the start's own: the tries below change it)
+                if (ref.ok) {
+                    std::string gpus, say;
+                    for (size_t i = 0; i < free0.size(); ++i) {
+                        const double f = free0[i];
+                        double lo = 0, hi = f;   // (lo holds, hi does not: to a MiB)
+                        while (hi - lo > 1048576.0) {
+                            const double mid = 0.5 * (lo + hi);
+                            free0[i] = f - mid;
+                            (pick() == ref ? lo : hi) = mid;
+                        }
+                        free0[i] = f;
+                        char bus[32] = "?";
+                        if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, G[i].dev) != cudaSuccess) {
+                            cudaGetLastError();
+                            std::snprintf(bus, sizeof bus, "?");
+                        }
+                        char gb[160];
+                        std::snprintf(gb, sizeof gb, "%s%s,%.0f,%.0f", gpus.empty() ? "" : ";", bus, f, lo);
+                        gpus += gb;
+                        std::snprintf(gb, sizeof gb, "%sGPU%zu (%s) %.2f GB free, %.2f GB of it spare", say.empty() ? "" : "; ",
+                                      i, bus, f / 1e9, lo / 1e9);
+                        say += gb;
+                    }
+                    room_out = std::string("room_rows=") + (ref.q8 ? "q8" : "f16") + " room_drafter=" + (ref.df ? "1" : "0") +
+                               " room_streamed=" + (streamed ? "1" : "0") + " room_gpus=" + gpus;
+                    room_line = "INFO VRAM room (--room-report): " + say + " - this start's choices hold with that much "
+                                "less free (" + room_out + ")";
                 }
             }
+            std::string e1, df_why;
+            bool ok1 = decide(e1, df_why);
+            if (!room_line.empty()) info.push_back(room_line);
             if (!ok1) {
                 if (!e1.empty()) err = e1;   // (else a CUDA call's, in err already)
                 return false;
@@ -2833,33 +3154,26 @@ struct Model::Impl {
                 CK(cudaMallocHost(&h_egs, sizeof(float) * (size_t) pk.eg.modules * Tc * pk.eg.cols()));
             }
             if (const char* ed = std::getenv("HY4_EG_DUMP")) eg_dump = std::fopen(ed, "wb");
-            {
-                char buf[200];
-                std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, the table read from the disk a row at a time; "
-                              "norm eps %.9g; row scales %s", pk.eg.modules, (double) eg_eps, eg_scale ? "on" : "none");
-                info.push_back(buf);
-            }
-            // its pages mapped into this process in the background (MADV_POPULATE_READ, else a read a page): a
+            // its pages mapped into this process in the background (mm3::os::populate_mapped: Linux
+            // MADV_POPULATE_READ, Windows PrefetchVirtualMemory, else a read a page - on every platform, #1069): a
             // window's lookups land on random pages of tens of GB, and each first touch is a page fault - faults that
             // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
             // a looked-up row's page is read at its first use - Maya never pulls an n-gram table into RAM by itself
             const char* ep = std::getenv("HY4_EG_POPULATE");
-            if (ep && std::atoi(ep) != 0) {
+            const bool eg_populate = ep && std::atoi(ep) != 0;
+            {
+                char buf[240];
+                std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, %s; norm eps %.9g; row scales %s",
+                              pk.eg.modules,
+                              eg_populate ? "the table's pages mapped in the background (HY4_EG_POPULATE)"
+                                          : "the table read from the disk a row at a time",
+                              (double) eg_eps, eg_scale ? "on" : "none");
+                info.push_back(buf);
+            }
+            if (eg_populate) {
                 eg_populator = std::thread([this] {
-#if defined(__linux__)
-                    (void) nice(10);
-                    const size_t pg = 4096, chunk = (size_t) 256 << 20;
-                    uint8_t* a = (uint8_t*) ((uintptr_t) eg_table & ~(uintptr_t) (pg - 1));
-                    uint8_t* end = (uint8_t*) eg_table + eg_bytes;
-                    for (uint8_t* c = a; c < end && !placer_stop.load(); c += chunk) {
-                        const size_t n = (size_t) std::min<ptrdiff_t>((ptrdiff_t) chunk, end - c);
-#if defined(MADV_POPULATE_READ)
-                        if (madvise(c, n, MADV_POPULATE_READ) == 0) continue;
-#endif
-                        volatile uint8_t sink = 0;
-                        for (size_t b = 0; b < n; b += pg) sink ^= c[b];
-                    }
-#endif
+                    lower_this_thread();   // (below the engine's own threads: Linux nice 10, Windows below normal)
+                    (void) mm3::os::populate_mapped(eg_table, eg_bytes, placer_stop);
                 });
             }
         }
@@ -2983,7 +3297,7 @@ struct Model::Impl {
         // the routed experts in VRAM (INFO vram_slots): the layer split's per layer (n_res); tensor parallel's L holds
         // none - its members (TL) and helpers hold every expert's slices, so they are counted there
         int n_partial = 0, n_res = 0, n_all = 0;
-        for (const Layer& l : L)
+        for (const Layer& l : lane_layers())
             if (!l.dense) {
                 n_partial += l.partial();
                 if (tp > 1) {
@@ -3006,13 +3320,13 @@ struct Model::Impl {
             CK(cudaMallocHost(&h_lat, sizeof(float) * Tc * g.n_lat));
             CK(cudaMallocHost(&h_cpu, sizeof(float) * Tc * g.n_lat));
             size_t blob = 0;
-            for (const Layer& l : L) blob = std::max(blob, l.blob);
+            for (const Layer& l : lane_layers()) blob = std::max(blob, l.blob);
             CK(cudaMallocHost(&h_stage, blob * kStage));
             stage_blob = blob;
             CK(cudaMallocHost(&h_pmap, sizeof(int) * g.n_expert));
             for (size_t gi = 0; gi < G.size(); ++gi) {   // (the staging slots where a GPU holds such layers)
                 bool any = false;
-                for (const Layer& l : L) any |= l.gpu == (int) gi && l.partial();
+                for (const Layer& l : lane_layers()) any |= l.gpu == (int) gi && l.partial();
                 if (!any) continue;
                 CK(cudaSetDevice(G[gi].dev));
                 if ((!G[gi].stage && !G[gi].alloc(G[gi].stage, blob * kStage, err)) ||
@@ -3025,13 +3339,28 @@ struct Model::Impl {
                     CK(cudaMemcpy(G[gi].stage, h_stage, blob * kStage, cudaMemcpyHostToDevice));
                 G[gi].h2d_gbs = 2.0 * blob * kStage / 1e9 / std::max(1e-6, now_s() - t0);
             }
+            if (tp > 1)   // (each member streams its share of the experts no member holds: its own slots and buffers)
+                for (int j = 0; j < tp; ++j) {
+                    Gpu& gm = G[(size_t) mem[(size_t) j]];
+                    CK(cudaSetDevice(gm.dev));
+                    if (!gm.stage && (!gm.alloc(gm.stage, blob * kStage, err) || !gm.alloc(gm.pmap, (size_t) g.n_expert, err)))
+                        return false;
+                    CK(cudaMallocHost(&gm.hs_ids, sizeof(int) * Tc * 16));
+                    CK(cudaMallocHost(&gm.hs_stage, blob * kStage));
+                    CK(cudaMallocHost(&gm.hs_pmap, sizeof(int) * g.n_expert));
+                }
             char buf[240];
             std::snprintf(buf, sizeof buf, "INFO CPU lane: %d of %d routed experts in VRAM (%.0f%%), the rest on %d CPU "
                           "threads from the model's file%s", n_res, n_all, 100.0 * n_res / std::max(1, n_all),
                           lane->threads() + 1, lane->nodes() > 1 ? " (their pages spread over the NUMA nodes in the "
                                                                    "background)" : "");
             info.push_back(buf);
-            if (hot.on) {
+            if (hot.on && tp > 1) {
+                std::snprintf(buf, sizeof buf, "INFO HY4_HOT: tensor parallel places the experts in VRAM at the start (by "
+                              "%s) and keeps the answers' routing for the next one, no swaps between",
+                              hot.loaded ? hot.file.c_str() : !prof_in.empty() ? "the profile" : "their order, no scores yet");
+                info.push_back(buf);
+            } else if (hot.on) {
                 std::snprintf(buf, sizeof buf, "INFO HY4_HOT: the experts in VRAM follow the answers' routing (placed by "
                               "%s), every %d token steps up to %d swaps", hot.loaded ? hot.file.c_str() :
                               !prof_in.empty() ? "the profile" : "their order, no scores yet", hot.every, hot.max_swaps);
@@ -3044,11 +3373,11 @@ struct Model::Impl {
 #if defined(__linux__)
                     (void) nice(10);
 #endif
-                    for (const Layer& l : L) {
+                    for (const Layer& l : lane_layers()) {
                         if (!l.partial()) continue;
                         std::vector<int> cpu;
                         for (int e = 0; e < (int) l.slot_of.size(); ++e)
-                            if (l.slot_of[(size_t) e] < 0) cpu.push_back(e);
+                            if (l.on_lane(e)) cpu.push_back(e);
                         place_experts(l.cex, cpu, nodes, placer_stop);
                     }
                     placing.store(false);
@@ -3059,9 +3388,9 @@ struct Model::Impl {
                 // nor the disk after a cold start.  Asked for (HY4_LANE_WARM=1): the thread takes a
                 // minute or two a 40 GB of experts on Windows and slows a decode beside it a little meanwhile
                 uint64_t lane_bytes = 0;
-                for (const Layer& l : L)
+                for (const Layer& l : lane_layers())
                     if (l.partial())
-                        lane_bytes += (uint64_t) (g.n_expert - l.n_res) * (2 * l.cex.g_stride + l.cex.d_stride);
+                        lane_bytes += (uint64_t) l.n_lane() * (2 * l.cex.g_stride + l.cex.d_stride);
                 const char* we = std::getenv("HY4_LANE_WARM");
                 const uint64_t avail = ram_available();
                 if (we && std::atoi(we) != 0 && avail > 0 && (double) avail > 1.1 * (double) lane_bytes + 2e9) {
@@ -3071,11 +3400,11 @@ struct Model::Impl {
 #if defined(__linux__)
                         (void) nice(10);
 #endif
-                        for (const Layer& l : L) {
+                        for (const Layer& l : lane_layers()) {
                             if (!l.partial()) continue;
                             std::vector<int> cpu;
                             for (int e = 0; e < (int) l.slot_of.size(); ++e)
-                                if (l.slot_of[(size_t) e] < 0) cpu.push_back(e);
+                                if (l.on_lane(e)) cpu.push_back(e);
                             warm_experts(l.cex, cpu, placer_stop);
                         }
                         placing.store(false);
@@ -3414,22 +3743,23 @@ struct Model::Impl {
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
         }
         k::q8_heads(x, ldt, ldh, T, H, M.k, gp.xq, gp.xd, gp.s);
-#if defined(STRATA_USE_HIP)
-        {   // (AMD: every head in one launch - the same rows' sums as the jobs below, 8 heads a launch)
-            iq::MvJob j;
-            j.w = M.w;
-            j.ld = M.ld;
-            j.type = M.type;
-            j.k = M.k;
-            j.n = M.n;
-            j.ncol = T;
-            j.xq = gp.xq;
-            j.xd = gp.xd;
-            j.y = y;
-            j.ycs = ldyt;
-            if (iq::mv_heads(j, H, (size_t) M.n * M.ld, (size_t) T * M.k, (size_t) T * M.k / 32, ldyh, gp.s)) return true;
-        }
-#endif
+        // every head in one launch (mv_heads) or 8 heads a launch (mv's jobs): a row's sums the same either way, so
+        // the faster of the two on this GPU - AMD: one launch; NVIDIA: both timed on the first one-token call (8 heads
+        // a launch until then), the faster kept for the GPU.  HY4_MV_HEADS=1 / 0: one launch / 8 heads a launch
+        iq::MvJob j1;
+        j1.w = M.w;
+        j1.ld = M.ld;
+        j1.type = M.type;
+        j1.k = M.k;
+        j1.n = M.n;
+        j1.ncol = T;
+        j1.xq = gp.xq;
+        j1.xd = gp.xd;
+        j1.y = y;
+        j1.ycs = ldyt;
+        auto one = [&] {
+            return iq::mv_heads(j1, H, (size_t) M.n * M.ld, (size_t) T * M.k, (size_t) T * M.k / 32, ldyh, gp.s);
+        };
         std::vector<iq::MvJob> jobs((size_t) H);
         for (int h = 0; h < H; ++h) {
             iq::MvJob& j = jobs[(size_t) h];
@@ -3444,9 +3774,51 @@ struct Model::Impl {
             j.y = y + (size_t) h * ldyh;
             j.ycs = ldyt;
         }
-        for (int h0 = 0; h0 < H; h0 += 64)
-            if (!iq::mv(jobs.data() + h0, std::min(64, H - h0), gp.s)) return false;
-        return true;
+        auto eight = [&] {
+            for (int h0 = 0; h0 < H; h0 += 64)
+                if (!iq::mv(jobs.data() + h0, std::min(64, H - h0), gp.s)) return false;
+            return true;
+        };
+#if defined(STRATA_USE_HIP)
+        if (one()) return true;
+        return eight();
+#else
+        static const int forced = [] {
+            const char* e = std::getenv("HY4_MV_HEADS");
+            return e ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+        }();
+        if (gp.heads_one < 0 && forced >= 0) gp.heads_one = forced;
+        if (gp.heads_one < 0 && T == 1) {
+            if (!one()) gp.heads_one = 0;   // (a type mv_heads does not take: the jobs)
+            if (gp.heads_one < 0) {   // (each form 6 times in turns, the first of each not counted; the best kept)
+                cudaEvent_t e0 = nullptr, e1 = nullptr;
+                float best[2] = {1e30f, 1e30f};
+                bool ok = cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
+                for (int r = 0; r < 12 && ok; ++r) {
+                    const int f = r & 1;
+                    float ms = 0.0f;
+                    ok = cudaEventRecord(e0, gp.s) == cudaSuccess && (f ? one() : eight()) &&
+                         cudaEventRecord(e1, gp.s) == cudaSuccess && cudaEventSynchronize(e1) == cudaSuccess &&
+                         cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+                    if (r >= 2) best[f] = std::min(best[f], ms);
+                }
+                if (e0) cudaEventDestroy(e0);
+                if (e1) cudaEventDestroy(e1);
+                if (!ok) {   // (not timed: the jobs, as before)
+                    gp.heads_one = 0;
+                    return eight();
+                }
+                gp.heads_one = best[1] < best[0] ? 1 : 0;
+                // (after the load's INFO lines: the first token's, on stderr)
+                std::fprintf(stderr, "maya-hy4: GPU %d: a token's head-by-head GEMVs %s (%d heads: %.1f us in one "
+                             "launch, %.1f us 8 heads a launch)\n", gp.dev, gp.heads_one ? "in one launch" :
+                             "8 heads a launch", H, best[1] * 1e3, best[0] * 1e3);
+                return true;   // (y as each form writes it: the same values)
+            }
+        }
+        if (gp.heads_one == 1 && one()) return true;
+        return eight();
+#endif
     }
 
     // A prompt sub-batch's attention (tokens t0 .. t0 + ts - 1 of the chunk) on the tensor cores: S = Q K^T over every
@@ -3985,13 +4357,18 @@ struct Model::Impl {
     // if all were in the page cache) and a headroom of max(4 GiB, a tenth of the RAM), a quarter of the RAM at most;
     // a thread re-codes the most routed experts while the lane is idle (between answers).  Whether they pay is
     // measured on this PC (the default, HY4_Q4X=2): a probe at the start (a lane call of 16 experts on each form)
-    // must time them 5 % faster, then, once copies exist, the next answers' one-token lane calls run in turns with
-    // and without them (q4x_trial) and the faster side is kept - the copies freed when without wins.  maya.py's
-    // q4x_calibration runs that once per PC and keeps the verdict in the config (HY4_Q4X=1 / 0), so a start of the
-    // config does not measure again.  The copies give the file's bits (the lane's output and the greedy ids the same
-    // with and without them, Linux and Windows builds); a prompt chunk's route - streamed to the GPU or the lane,
-    // chosen by measured rates - may still move with the lane's speed, as with any other load on the CPU.
-    // HY4_Q4X unset or 2: measured as above; 1: always, untimed; 0: never; HY4_Q4X_GB: the RAM they take at most
+    // must time them 5 % faster, then, once copies exist and the lane's experts are warm, the next answers' one-token
+    // lane calls run in turns with and without them (q4x_trial) and the faster side is kept - the copies freed when
+    // without wins.  The verdict is remembered on this PC (HY4_Q4X_FILE - the server's data folder - else beside
+    // --profile; a line a PC, model and lane-kernel build, hy4_lane's q4x_memo_*): a start that finds it builds the
+    // copies untimed (kept) or none at all (dropped: no RAM, no re-coding thread, no probe), and changed lane kernels
+    // are measured again (HY4_Q4X_MEASURE=1 - maya --speed-calibration - measures again too).  The copies give the
+    // file's bits (the lane's output and the greedy ids the same with and without them, Linux and Windows builds); a
+    // prompt chunk's route - streamed to the GPU or the lane, chosen by measured rates - may still move with the
+    // lane's speed, as with any other load on the CPU.
+    // HY4_Q4X unset or 2: measured as above (or remembered); 1: always, untimed; 0: never; HY4_Q4X_GB: the RAM they
+    // take at most; HY4_Q4X_PROBE=0: the timed turns run even where the start's probe found them not faster
+    std::string q4x_file, q4x_key;   // (the verdict's file and this PC's line in it: empty, not remembered)
     void q4x_start() {
         const char* qv = std::getenv("HY4_Q4X");
         const int mode = qv ? std::atoi(qv) : 2;
@@ -4021,25 +4398,61 @@ struct Model::Impl {
             info.push_back(buf);
             return;
         }
-        double ms_f = 0, ms_q = 0;
-        bool probed = false;
-        // (on a thread of its own: the lane pins the thread that brings it jobs, and the engine's own is not to be
-        //  pinned before its first job - a thread it starts would inherit that one core)
-        std::thread([&] { probed = q4x_probe(*lane, L[(size_t) probe_l].cex, g.n_expert, ms_f, ms_q); }).join();
-        if (!probed) return;
-        const bool faster = ms_q < 0.95 * ms_f;
-        std::snprintf(buf, sizeof buf, "INFO CPU lane: a call of 16 experts %.2f ms from the file, %.2f ms as 4-bit "
-                      "copies - ", ms_f, ms_q);
-        std::string line = buf;
-        if (!faster && !force) {
-            info.push_back(line + "the file's rows kept");
+        // the verdict this PC measured before (not with HY4_Q4X=1, nor HY4_Q4X_MEASURE=1)
+        Q4xMemo memo;
+        if (!force) {
+            const char* mf = std::getenv("HY4_Q4X_FILE");
+            const size_t sl = o.profile.find_last_of("/\\");
+            q4x_file = mf && *mf ? std::string(mf)
+                       : o.profile.empty() ? std::string()
+                                           : (sl == std::string::npos ? std::string(".") : o.profile.substr(0, sl)) +
+                                                 "/hy4-cpu-lane.txt";
+            const CpuExperts& pe = L[(size_t) probe_l].cex;
+            std::snprintf(buf, sizeof buf, "Hy4 %d layers x %d experts of %zu + %zu bytes", g.n_layer, g.n_expert,
+                          2 * pe.g_stride, pe.d_stride);
+            q4x_key = q4x_memo_key(buf, lane->threads() + 1);
+            const char* again = std::getenv("HY4_Q4X_MEASURE");
+            if (!q4x_file.empty() && !(again && std::atoi(again) != 0)) memo = q4x_memo_get(q4x_file, q4x_key);
+        }
+        if (memo.found && !memo.kept) {
+            std::snprintf(buf, sizeof buf, "INFO CPU lane: no 4-bit copies of its experts - not faster on this PC "
+                          "(measured %s: an expert run %.1f us with them, %.1f us without; ", memo.date.c_str(),
+                          memo.us_with, memo.us_without);
+            info.push_back(buf + q4x_file + ")");
             return;
         }
+        std::string line;
+        if (memo.found) {
+            std::snprintf(buf, sizeof buf, "INFO CPU lane: the 4-bit copies kept, as measured on this PC (%s: an expert "
+                          "run %.1f us with them, %.1f us without) - ", memo.date.c_str(), memo.us_with,
+                          memo.us_without);
+            line = buf;
+        } else {
+            double ms_f = 0, ms_q = 0;
+            bool probed = false;
+            // (on a thread of its own: the lane pins the thread that brings it jobs, and the engine's own is not to
+            //  be pinned before its first job - a thread it starts would inherit that one core)
+            std::thread([&] { probed = q4x_probe(*lane, L[(size_t) probe_l].cex, g.n_expert, ms_f, ms_q); }).join();
+            if (!probed) return;
+            const bool faster = ms_q < 0.95 * ms_f;
+            std::snprintf(buf, sizeof buf, "INFO CPU lane: a call of 16 experts %.2f ms from the file, %.2f ms as 4-bit "
+                          "copies - ", ms_f, ms_q);
+            line = buf;
+            const char* pv = std::getenv("HY4_Q4X_PROBE");   // (0: the timed turns decide, whatever the probe says)
+            if (!faster && !force) {
+                if (!(pv && std::atoi(pv) == 0)) {
+                    info.push_back(line + "the file's rows kept");
+                    return;
+                }
+                line += "not faster, tried anyway (HY4_Q4X_PROBE=0): ";
+            }
+        }
         std::snprintf(buf, sizeof buf, "the most routed experts re-coded between answers, up to %.1f GB of RAM%s",
-                      budget / 1e9, force ? " (HY4_Q4X=1)" : ", kept if answers run faster with them");
+                      budget / 1e9, force ? " (HY4_Q4X=1)" : memo.found ? "" : ", kept if answers run faster with "
+                                                                              "them (measured once on this PC)");
         info.push_back(line + buf);
-        q4x_adaptive = !force;
-        lane_count().q4x_mode.store(force ? 1 : 0, std::memory_order_relaxed);
+        q4x_adaptive = !force && !memo.found;
+        lane_count().q4x_mode.store(force || memo.found ? 1 : 0, std::memory_order_relaxed);
         for (Layer& l : L)
             if (l.partial()) l.cex.q4x = std::make_shared<Q4xSet>(g.n_expert);
         const int nodes = lane->nodes();
@@ -4105,34 +4518,71 @@ struct Model::Impl {
         });
     }
     // the routes in h_ids (T tokens of layer il) into the profile's counts
-    // (the engine's thread, after a lane call) the 4-bit copies' trial: started once copies exist, decided after 40
-    // tokens' one-token calls a side (over answers if need be) - kept when an expert run is 3 % faster with them, else
-    // the builder stopped and the copies freed
+    // (the engine's thread, after a lane call) the 4-bit copies' trial: started once copies exist and the lane's
+    // background placement / warm pass is done, timed in windows of 40 tokens' one-token calls a side (over answers if
+    // need be) and decided once two windows in a row agree - the same side faster, each side's expert run within 8 %
+    // of the window before: the lane's experts warm.  (A report's first start timed its file rows cold - still read
+    // from the disk, 4x its next start's time - and kept the copies; the next start, warm, dropped them.)  Kept when
+    // an expert run is 3 % faster with them, else the builder stopped and the copies freed; the verdict remembered
+    // for this PC (q4x_file).  Not settled after kQ4xWindows windows: decided for this run only, not remembered.
+    static constexpr int kQ4xWindows = 8;
     bool q4x_adaptive = false, q4x_decided = false;
     std::atomic<bool> q4x_stop{false};
     std::atomic<bool> q4x_pass{false};   // (the builder went once through every expert routed twice, or the RAM is full)
+    int q4x_windows = 0;
+    double q4x_prev[2] = {0, 0};          // (the window before: an expert run without / with the copies, s)
     void q4x_trial() {
         if (!q4x_adaptive || q4x_decided) return;
         LaneCount& lc = lane_count();
         const int m = lc.q4x_mode.load(std::memory_order_relaxed);
         if (m == 0) {
-            // (the turns start once the builder has been through the experts the counts asked for: the side with the
-            //  copies is timed with them in place, not while a few exist)
-            if (q4x_made.load(std::memory_order_relaxed) >= 64 && q4x_pass.load(std::memory_order_relaxed)) {
+            // (the turns start once the builder has been through the experts the counts asked for - the side with
+            //  the copies timed with them in place, not while a few exist - and no placement pass moves pages)
+            if (q4x_made.load(std::memory_order_relaxed) >= 64 && q4x_pass.load(std::memory_order_relaxed) &&
+                !placing.load(std::memory_order_relaxed)) {
                 for (int k = 0; k < 2; ++k) lc.trial_calls[k] = lc.trial_entries[k] = 0, lc.trial_s[k] = 0;
                 lc.q4x_mode.store(2, std::memory_order_relaxed);
+                std::fprintf(stderr, "maya-hy4: CPU lane: %lld experts re-coded at 4 bits (%.1f GB): timing the answers' "
+                             "one-token lane calls with and without them (windows of %lld calls a side, until two "
+                             "agree)\n", (long long) q4x_made.load(), (double) q4x_bytes.load() / 1e9,
+                             40LL * g.n_layer);
             }
             return;
         }
         const long long K = 40LL * g.n_layer;
         if (m != 2 || lc.trial_calls[0] < K || lc.trial_calls[1] < K) return;
-        q4x_decided = true;
         const double r0 = lc.trial_s[0] / (double) std::max(1LL, lc.trial_entries[0]);
         const double r1 = lc.trial_s[1] / (double) std::max(1LL, lc.trial_entries[1]);
-        const bool keep = r1 < 0.97 * r0;
+        const bool steady = q4x_windows > 0 && (r1 < 0.97 * r0) == (q4x_prev[1] < 0.97 * q4x_prev[0]) &&
+                            std::fabs(r0 - q4x_prev[0]) <= 0.08 * q4x_prev[0] &&
+                            std::fabs(r1 - q4x_prev[1]) <= 0.08 * q4x_prev[1];
+        ++q4x_windows;
+        if (!steady && q4x_windows < kQ4xWindows) {   // (the next window: these times stand for the one before)
+            q4x_prev[0] = r0;
+            q4x_prev[1] = r1;
+            for (int k = 0; k < 2; ++k) lc.trial_calls[k] = lc.trial_entries[k] = 0, lc.trial_s[k] = 0;
+            return;
+        }
+        q4x_decided = true;
+        const double w0 = steady ? 0.5 * (r0 + q4x_prev[0]) : r0, w1 = steady ? 0.5 * (r1 + q4x_prev[1]) : r1;
+        const bool keep = w1 < 0.97 * w0;
+        std::string note;
+        if (!steady) {
+            note = "; the times did not settle: not remembered, measured again at the next start";
+        } else if (q4x_file.empty()) {
+            note = "; not remembered (no data folder named)";
+        } else {
+            Q4xMemo mm;
+            mm.kept = keep;
+            mm.us_with = w1 * 1e6;
+            mm.us_without = w0 * 1e6;
+            note = q4x_memo_put(q4x_file, q4x_key, mm) ? "; remembered for this PC in " + q4x_file
+                                                       : "; not remembered (" + q4x_file + " could not be written)";
+        }
         std::fprintf(stderr, "maya-hy4: CPU lane: the 4-bit copies %s - an expert run %.1f us with them, %.1f us without "
-                     "(%lld / %lld one-token calls, %lld experts re-coded)\n", keep ? "kept" : "dropped", r1 * 1e6,
-                     r0 * 1e6, lc.trial_calls[1], lc.trial_calls[0], (long long) q4x_made.load());
+                     "(%d windows of %lld one-token calls a side, the last %d timed in; %lld experts re-coded)%s\n",
+                     keep ? "kept" : "dropped", w1 * 1e6, w0 * 1e6, q4x_windows, K, steady ? 2 : 1,
+                     (long long) q4x_made.load(), note.c_str());
         if (keep) {
             lc.q4x_mode.store(1, std::memory_order_relaxed);
             return;
@@ -4199,7 +4649,7 @@ struct Model::Impl {
         for (int i = 0; i < n; ++i) {
             const int e = h_ids[i];
             ++c[e];
-            hot.win_hits += l.slot_of[(size_t) e] >= 0;
+            hot.win_hits += !l.on_lane(e);
         }
         hot.win_picks += n;
     }
@@ -4222,7 +4672,7 @@ struct Model::Impl {
         std::vector<Sw> plan;
         size_t wanted = 0;
         std::vector<int> res, cpu;
-        for (Layer& l : L) {
+        for (Layer& l : lane_layers()) {
             if (!l.partial() || l.il >= g.n_layer) continue;
             float* sc = hot.score.data() + (size_t) l.il * g.n_expert;
             uint32_t* w = hot.win.data() + (size_t) l.il * g.n_expert;
@@ -4230,6 +4680,7 @@ struct Model::Impl {
                 sc[e] = sc[e] * decay + (float) w[e];
                 w[e] = 0;
             }
+            if (tp > 1) continue;   // (tensor parallel: an expert's GPU is the load's - the scores place the next start)
             res.clear();
             cpu.clear();
             for (int e = 0; e < g.n_expert; ++e) (l.slot_of[(size_t) e] >= 0 ? res : cpu).push_back(e);
@@ -4374,36 +4825,70 @@ struct Model::Impl {
     // A prompt chunk's experts that are not in VRAM, streamed: the ones the chunk uses, in passes of kStage, each pass
     // copied from the model's file into the pinned bounce (the CPU lane's threads) and on to the GPU's staging slots in
     // one copy, its sets run there and added to latout
-    bool experts_streamed(Layer& l, Gpu& gp, int T, std::string& err) {
+    // (share: tensor parallel with the CPU lane, this member's share of the experts no member holds, from its own copy
+    //  of the routing, through its own pinned bounce on a few threads of its own: the members stream side by side)
+    bool experts_streamed(Layer& l, Gpu& gp, int T, std::string& err, bool share = false) {
         const int nu = g.n_used, ne = g.n_expert;
-        count_routes(l.il, T);
         cudaStream_t s = gp.s;
+        const bool own_ids = share && l.tpm > 0;   // (member 0 has the routing in h_ids: its lane's copy)
+        int* ids = own_ids ? gp.hs_ids : h_ids;
+        uint8_t* bounce = share ? gp.hs_stage : h_stage;
+        int* pmap_h = share ? gp.hs_pmap : h_pmap;
+        if (own_ids) {
+            CK(cudaMemcpyAsync(ids, gp.ids, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+        } else {
+            count_routes(l.il, T);
+        }
         std::vector<char> used((size_t) ne, 0);
         for (int i = 0; i < T * nu; ++i)
-            if (l.slot_of[(size_t) h_ids[i]] < 0) used[(size_t) h_ids[i]] = 1;
+            if (share ? l.stream_e[(size_t) ids[i]] != 0 : l.on_lane(ids[i])) used[(size_t) ids[i]] = 1;
         std::vector<int> u;
         for (int e = 0; e < ne; ++e)
             if (used[(size_t) e]) u.push_back(e);
+        if (l.tpm >= 0 && !u.empty()) {
+            // (the slots still hold this layer's experts, the chunk's other half's: no copy where they cover this half's)
+            const int m = l.tpm & 15;
+            bool there = share && stg_il[m] == l.il;
+            for (size_t i = 0; there && i < u.size(); ++i) there = pmap_h[u[i]] >= 0;
+            if (there) return experts_sets(l, gp, T, err, gp.pmap, gp.stage, stg_np[m], true);
+            stg_il[m] = share && u.size() <= (size_t) kStage ? l.il : -1;
+            stg_np[m] = (int) u.size();
+        }
         const CpuExperts& cx = l.cex;
         const size_t gb = cx.g_stride, db = cx.d_stride;
         for (size_t p0 = 0; p0 < u.size(); p0 += (size_t) kStage) {
             const int np = (int) std::min(u.size() - p0, (size_t) kStage);
             const double tc = now_s();
-            lane->parallel_for(np * 3, [&](int it) {
+            auto copy = [&](int it) {
                 const int i = it / 3, role = it % 3, e = u[p0 + (size_t) i];
-                uint8_t* dst = h_stage + (size_t) i * l.blob + l.tr[role];
+                uint8_t* dst = bounce + (size_t) i * l.blob + l.tr[role];
                 const uint8_t* src = role == 0 ? cx.gate + (size_t) e * gb : role == 1 ? cx.up + (size_t) e * gb
                                                                                        : cx.down + (size_t) e * db;
                 std::memcpy(dst, src, role == 2 ? db : gb);
-            });
-            st.stream_ms += (now_s() - tc) * 1e3;
-            CK(cudaMemcpyAsync(gp.stage, h_stage, (size_t) np * l.blob, cudaMemcpyHostToDevice, s));
-            for (int e = 0; e < ne; ++e) h_pmap[e] = -1;
-            for (int i = 0; i < np; ++i) h_pmap[u[p0 + (size_t) i]] = i;
-            CK(cudaMemcpyAsync(gp.pmap, h_pmap, sizeof(int) * ne, cudaMemcpyHostToDevice, s));
+            };
+            if (share) {   // (the lane's pool is one caller's: a member's own threads)
+                std::atomic<int> next{0};
+                std::vector<std::thread> th;
+                // (the lane's cores shared out over the members, kShareThreads at least: the copies are bound by the
+                //  RAM's speed, and 8 a member was a sixth of the lane's rate on 2 of 3 Tesla V100s of a 40-core PC)
+                const int nth = std::max(kShareThreads, (lane ? lane->threads() + 1 : 0) / std::max(1, tp));
+                for (int w = 0; w < std::min(nth, np * 3); ++w)
+                    th.emplace_back([&] {
+                        for (int it; (it = next.fetch_add(1)) < np * 3;) copy(it);
+                    });
+                for (auto& t : th) t.join();
+            } else {
+                lane->parallel_for(np * 3, copy);
+            }
+            if (!own_ids) st.stream_ms += (now_s() - tc) * 1e3;
+            CK(cudaMemcpyAsync(gp.stage, bounce, (size_t) np * l.blob, cudaMemcpyHostToDevice, s));
+            for (int e = 0; e < ne; ++e) pmap_h[e] = -1;
+            for (int i = 0; i < np; ++i) pmap_h[u[p0 + (size_t) i]] = i;
+            CK(cudaMemcpyAsync(gp.pmap, pmap_h, sizeof(int) * ne, cudaMemcpyHostToDevice, s));
             if (!experts_sets(l, gp, T, err, gp.pmap, gp.stage, np, true)) return false;
             CK(cudaStreamSynchronize(s));   // (the bounce and the map are the next pass's)
-            st.streamed += np;
+            if (!own_ids) st.streamed += np;
         }
         return true;
     }
@@ -4493,6 +4978,7 @@ struct Model::Impl {
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                             (size_t) sf}}, gp.xf, E, T);
             }
+            bool sh_early = false;   // (the shared expert's down already queued - one GPU's token windows, below)
             if (lane_on) {
                 CK(cudaMemcpyAsync(h_ids, gp.ids, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));
                 CK(cudaMemcpyAsync(h_w, gp.rw, sizeof(float) * T * nu, cudaMemcpyDeviceToHost, s));
@@ -4501,6 +4987,12 @@ struct Model::Impl {
                 if (T <= W)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                                 (size_t) sf}}, gp.xf, E, T);
+                if (T <= W && l.tpm < 0) {   // (its down as well, beside the lane: off the GPU's path after the lane's
+                    //  sum - the same kernels on the same rows, gp.cur added after the up-projection as before)
+                    k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
+                    ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+                    sh_early = true;
+                }
                 k::submit(s);   // (AMD under Windows: the copies and the shared expert started now, not at the wait)
                 const double tw = now_s();
                 // (a token's copies are there within a millisecond or two: polled that long - a thread that sleeps on
@@ -4519,15 +5011,19 @@ struct Model::Impl {
             }
             const int* slot = lane_on || l.tpm >= 0 ? l.slot_d : nullptr;
             bool streamed = false;
+            const bool share = l.tpm >= 0 && !l.stream_e.empty() && T >= kTpStream;
             if (T > W) {
                 ok = ok && experts_sets(l, gp, T, err, slot);
                 // a prompt chunk's experts not in VRAM: streamed to the GPU, or the CPU lane - whichever the measured
                 // rates say is faster for this many experts and entries (a PC's PCIe against its CPU)
-                if (lane_on) {
+                if (share) {   // (tensor parallel with the CPU lane: every member its share, to its own GPU)
+                    ok = ok && experts_streamed(l, gp, T, err, true);
+                    streamed = true;
+                } else if (lane_on) {
                     int n_ent = 0;
                     std::vector<char> used((size_t) g.n_expert, 0);
                     for (int i = 0; i < T * nu; ++i)
-                        if (l.slot_of[(size_t) h_ids[i]] < 0) {
+                        if (l.on_lane(h_ids[i])) {
                             ++n_ent;
                             used[(size_t) h_ids[i]] = 1;
                         }
@@ -4563,7 +5059,7 @@ struct Model::Impl {
                 for (int t = 0; t < T; ++t)
                     for (int j = 0; j < nu; ++j) {
                         const int e = h_ids[t * nu + j];
-                        if (l.slot_of[(size_t) e] < 0) lane_entries.push_back({t, e, h_w[t * nu + j]});
+                        if (l.on_lane(e)) lane_entries.push_back({t, e, h_w[t * nu + j]});
                     }
                 const double tc = now_s();
                 cpu_experts(*lane, l.cex, lane_entries, h_lat, T, h_cpu);
@@ -4606,8 +5102,10 @@ struct Model::Impl {
             ok = ok && mm(gp, l.rup, gp.latout, lat, T, gp.y, E);
             dbg("ffn_moe_up", l.il, gp, gp.y, T, E);
             // the shared expert
-            k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
-            ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+            if (!sh_early) {
+                k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
+                ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+            }
             dbg("ffn_shexp", l.il, gp, gp.cur, T, E);
             if (inject) ref_cmp("ffn_shexp", l.il, gp, gp.cur, (size_t) T * E, T);
             k::add(gp.y, gp.cur, (size_t) T * E, s);
@@ -5370,6 +5868,28 @@ struct Model::Impl {
         return true;
     }
 
+    // An error after a GPU fault: the fault named first.  A kernel's illegal memory access is sticky - every launch and
+    // cuBLAS call after it fails too, and the error that ends the step ("a GEMV the kernels do not take": cuBLAS
+    // refusing) only follows from it.  Only when a launch failed in this process and a GPU is in that state (else the
+    // error as it was)
+    void name_fault(std::string& err) {
+        static const char* kTag = "the GPU stopped";
+        const std::string f = k::first_fault();
+        if (f.empty() || err.rfind(kTag, 0) == 0) return;
+        int cur = -1;
+        if (cudaGetDevice(&cur) != cudaSuccess) cur = -1;
+        cudaError_t e = cudaSuccess;
+        for (const Gpu& gp : G) {
+            if (cudaSetDevice(gp.dev) != cudaSuccess) continue;
+            const cudaError_t d = cudaDeviceSynchronize();
+            if (e == cudaSuccess) e = d;
+        }
+        if (cur >= 0) (void) cudaSetDevice(cur);
+        if (e == cudaSuccess) return;
+        err = std::string(kTag) + ": " + cudaGetErrorString(e) + " (first reported at the launch of " + f +
+              "; CUDA reports a kernel's fault at a later launch - CUDA_LAUNCH_BLOCKING=1 names the kernel that faulted)"
+              " - then: " + err;
+    }
     bool window(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
         const int E = g.n_embd, hc = g.hc;
         win_t0 = now_s();
@@ -6233,6 +6753,7 @@ bool Model::load(const Options& o, std::string& err) {
     m->mtp_done = 0;
     m->st = keep;
     if (!ok) {
+        m->name_fault(err);
         err = "the warm-up: " + err;
         return false;
     }
@@ -6287,7 +6808,10 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
     int done = 0;
     while (done < n) {
         const int T = done < head ? std::min(Tc, head - done) : last;
-        if (!m->window(ids + done, T, pos0 + done, done + T == n ? want : 0, logits_out, err)) return false;
+        if (!m->window(ids + done, T, pos0 + done, done + T == n ? want : 0, logits_out, err)) {
+            m->name_fault(err);
+            return false;
+        }
         done += T;
         m->end = pos0 + done;
         m->st.tokens += T;
@@ -6376,5 +6900,6 @@ void Model::set_images(std::vector<Image> images) {
 }
 const Stats& Model::stats() const { return m->st; }
 std::vector<std::string> Model::info_lines() const { return m->info; }
+std::string Model::room_report() const { return m->room_out; }
 
 }  // namespace hy4

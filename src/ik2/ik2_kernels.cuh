@@ -449,6 +449,7 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 
 /// ggml type ids of the blocks these decode.
 constexpr int kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_XS = 23, kNVFP4 = 40;
+constexpr int kQ3_K = 11, kQ4_K = 12, kIQ2_XS = 17, kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kBF16 = 30;
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);
 size_t block_bytes(int type);

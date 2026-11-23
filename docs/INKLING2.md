@@ -435,6 +435,12 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 
 **Files** (Apache 2.0, the model and unsloth's GGUF alike):
 
+The decoder also reads the extra tensor types in Unsloth's root `UD-Q3_K_XL` and `UD-Q8_K_XL` files:
+IQ2_XS, IQ2_S, IQ3_S, IQ4_NL, Q3_K, Q4_K and BF16. These use the generic GPU row kernels; the CPU lane still
+requires NVFP4 / Q8_0 experts, so a quant with other expert types uses GPU fetches instead. Each expert matrix's
+input width is checked against its own block size (the gate/up input is C, the down input is F). The independent
+`ik2_quant_formats_test` compares host/GPU decoding and dense/expert products with the pinned ggml CPU decoders.
+
 | File | Repository | sha256 |
 |---|---|---|
 | `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |

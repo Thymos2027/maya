@@ -2735,6 +2735,81 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
 }
 
 __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, size_t v) {
+    if (type == kBF16) {
+        return bits_to_float(((uint32_t) blocks[2 * v] | ((uint32_t) blocks[2 * v + 1] << 8)) << 16);
+    }
+    if (type == kIQ4_NL) {
+        const uint8_t* b = blocks + (v / 32) * 18;
+        const int j = (int) (v % 32);
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const uint8_t q = b[2 + (j & 15)];
+        return d * (float) iq4nl_at(j < 16 ? q & 15 : q >> 4);
+    }
+    if (type == kIQ2_XS || type == kIQ2_S) {
+        const uint8_t* b = blocks + (v / 256) * (type == kIQ2_XS ? 74 : 82);
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const int scales = b[(type == kIQ2_XS ? 66 : 74) + ib];
+        const float db = d * (0.5f + (float) ((scales >> (4 * (l / 2))) & 15)) * 0.25f;
+        uint64_t grid;
+        uint32_t signs;
+        if (type == kIQ2_XS) {
+            const int p = 2 + 2 * (4 * ib + l);
+            const uint32_t q = (uint32_t) b[p] | ((uint32_t) b[p + 1] << 8);
+#ifdef __CUDA_ARCH__
+            grid = __ldg(ik2_iq::dev::iq2xs_grid + (q & 511));
+#else
+            grid = ik2_iq::host::iq2xs_grid[q & 511];
+#endif
+            signs = iq_signs8(q >> 9);
+        } else {
+            const int q = b[2 + 4 * ib + l] | ((b[66 + ib] << (8 - 2 * l)) & 0x300);
+#ifdef __CUDA_ARCH__
+            grid = __ldg(ik2_iq::dev::iq2s_grid + q);
+#else
+            grid = ik2_iq::host::iq2s_grid[q];
+#endif
+            signs = b[34 + 4 * ib + l];
+        }
+        return db * (float) ((grid >> (8 * j)) & 255) * ((signs >> j) & 1 ? -1.0f : 1.0f);
+    }
+    if (type == kIQ3_S) {
+        const uint8_t* b = blocks + (v / 256) * 110;
+        const int i = (int) (v % 256), ib = i / 32, l = (i % 32) / 8, j = i % 8;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float db = d * (float) (1 + 2 * ((b[106 + ib / 2] >> (4 * (ib & 1))) & 15));
+        const int half = j / 4;
+        const int q = b[2 + 8 * ib + 2 * l + half] | ((b[66 + ib] << (8 - 2 * l - half)) & 256);
+        uint32_t grid;
+#ifdef __CUDA_ARCH__
+        grid = __ldg(ik2_iq::dev::iq3s_grid + q);
+#else
+        grid = ik2_iq::host::iq3s_grid[q];
+#endif
+        const int signs = b[74 + 4 * ib + l];
+        return db * (float) ((grid >> (8 * (j & 3))) & 255) * ((signs >> j) & 1 ? -1.0f : 1.0f);
+    }
+    if (type == kQ3_K) {
+        const uint8_t* b = blocks + (v / 256) * 110;
+        const int i = (int) (v % 256), is = i / 16;
+        const float d = half_bits_to_float((uint16_t) (b[108] | (b[109] << 8)));
+        const int sc = ((b[96 + is % 8] >> (4 * (is / 8))) & 15) |
+                       (((b[104 + is % 4] >> (2 * (is / 4))) & 3) << 4);
+        const int low = (b[32 + (i / 128) * 32 + i % 32] >> (2 * ((i % 128) / 32))) & 3;
+        const int q = low - ((b[i % 32] & (1 << (i / 32))) ? 0 : 4);
+        return (d * (float) (sc - 32)) * (float) q;
+    }
+    if (type == kQ4_K) {
+        const uint8_t* b = blocks + (v / 256) * 144;
+        const int i = (int) (v % 256), group = i / 64, half = (i % 64) / 32, is = 2 * group + half;
+        const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+        const float mn = half_bits_to_float((uint16_t) (b[2] | (b[3] << 8)));
+        const uint8_t* s = b + 4;
+        const int sc = is < 4 ? s[is] & 63 : (s[is + 4] & 15) | ((s[is - 4] >> 6) << 4);
+        const int m = is < 4 ? s[is + 4] & 63 : (s[is + 4] >> 4) | ((s[is] >> 6) << 4);
+        const int q = (b[16 + 32 * group + i % 32] >> (4 * half)) & 15;
+        return (d * (float) sc) * (float) q - mn * (float) m;
+    }
     if (type == kNVFP4) {
         const int8_t kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
         const uint8_t* b = blocks + (v / 64) * 36;
@@ -6424,12 +6499,14 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 }
 
 int block_values(int type) {
-    return type == kNVFP4 ? 64 : type == kQ8_0 ? 32
-         : type == kQ5_K || type == kQ6_K || type == kIQ3_XXS || type == kIQ4_XS ? 256 : 0;
+    return type == kBF16 ? 1 : type == kNVFP4 ? 64 : type == kQ8_0 || type == kIQ4_NL ? 32
+         : type == kQ3_K || type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ2_XS ||
+           type == kIQ2_S || type == kIQ3_S || type == kIQ3_XXS || type == kIQ4_XS ? 256 : 0;
 }
 size_t block_bytes(int type) {
     return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kQ5_K ? 176 : type == kQ6_K ? 210
-         : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : 0;
+         : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : type == kBF16 ? 2 : type == kIQ4_NL ? 18
+         : type == kIQ2_XS ? 74 : type == kIQ2_S ? 82 : type == kIQ3_S || type == kQ3_K ? 110 : type == kQ4_K ? 144 : 0;
 }
 
 template <int WARPS, int ROWS>
